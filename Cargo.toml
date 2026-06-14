@@ -1,0 +1,23 @@
+[package]
+name = "axum-client-addr"
+version = "0.1.0"
+authors = ["Magic Len <len@magiclen.org>"]
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/magiclen/axum-client-addr"
+homepage = "https://magiclen.org/axum-client-addr"
+keywords = ["axum", "proxy", "client", "ip", "http"]
+categories = ["web-programming"]
+description = "Resolve client IP addresses in `axum` from trusted proxy headers with safe socket fallback."
+license = "MIT"
+include = ["src/**/*", "examples/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio"] }
+cidr = "0.3"
+cidr-utils = { version = "0.7", default-features = false, features = ["combiner"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+governor = "0.10.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
