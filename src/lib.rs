@@ -50,8 +50,8 @@ mod headers;
 
 pub use cidr::IpCidr;
 pub use config::{
-    ChainHeader, ClientIpConfig, ClientIpConfigBuilder, TrustAllChainIpSelection,
-    TrustAllProxyMode, TrustedProxyMetadata, TrustedProxyRule,
+    ChainHeader, ClientIpConfig, ClientIpConfigBuilder, ClientIpConfigSource,
+    TrustAllChainIpSelection, TrustAllProxyMode, TrustedProxyMetadata, TrustedProxyRule,
 };
 pub use errors::{ClientIpConfigBuildError, ClientIpRejection};
 pub use extractor::{ClientIp, ClientIpSource, resolve_client_ip};

@@ -1,12 +1,13 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::{
-    extract::{ConnectInfo, FromRef, FromRequestParts},
+    extract::{ConnectInfo, FromRequestParts},
     http::{HeaderMap, request::Parts},
 };
 
 use crate::{
-    ChainHeader, ClientIpConfig, ClientIpRejection, TrustAllChainIpSelection, TrustAllProxyMode,
+    ChainHeader, ClientIpConfig, ClientIpConfigSource, ClientIpRejection, TrustAllChainIpSelection,
+    TrustAllProxyMode,
     headers::{configured_client_ip_header, forwarded_ips, list_header_ips, x_forwarded_for_ips},
 };
 
@@ -64,8 +65,7 @@ pub enum ClientIpSource {
 
 impl<S> FromRequestParts<S> for ClientIp
 where
-    S: Send + Sync,
-    ClientIpConfig: FromRef<S>,
+    S: Send + Sync + ClientIpConfigSource,
 {
     type Rejection = ClientIpRejection;
 
@@ -76,9 +76,7 @@ where
             .map(|connect_info| connect_info.0)
             .ok_or(ClientIpRejection::MissingConnectInfo)?;
 
-        let config = ClientIpConfig::from_ref(state);
-
-        Ok(resolve_client_ip(&parts.headers, socket_addr, &config))
+        Ok(resolve_client_ip(&parts.headers, socket_addr, state.client_ip_config()))
     }
 }
 

@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc};
 
 use axum::http::HeaderName;
 use cidr::IpCidr;
@@ -20,6 +20,12 @@ pub struct ClientIpConfig {
     pub(crate) trusted_proxies:    Vec<TrustedProxyRule>,
     pub(crate) chain_header_order: Vec<ChainHeader>,
     pub(crate) trust_all_mode:     Option<TrustAllProxyMode>,
+}
+
+/// Provides borrowed access to [`ClientIpConfig`] from application state.
+pub trait ClientIpConfigSource {
+    /// Return the config used by the [`crate::ClientIp`] extractor.
+    fn client_ip_config(&self) -> &ClientIpConfig;
 }
 
 impl ClientIpConfig {
@@ -62,6 +68,23 @@ impl ClientIpConfig {
     #[inline]
     pub(crate) fn rule_for(&self, ip: IpAddr) -> Option<&TrustedProxyRule> {
         self.trusted_proxies.iter().find(|rule| rule.cidr.contains(&ip))
+    }
+}
+
+impl ClientIpConfigSource for ClientIpConfig {
+    #[inline]
+    fn client_ip_config(&self) -> &ClientIpConfig {
+        self
+    }
+}
+
+impl<T> ClientIpConfigSource for Arc<T>
+where
+    T: ClientIpConfigSource + ?Sized,
+{
+    #[inline]
+    fn client_ip_config(&self) -> &ClientIpConfig {
+        self.as_ref().client_ip_config()
     }
 }
 

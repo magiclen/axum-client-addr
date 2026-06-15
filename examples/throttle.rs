@@ -6,13 +6,13 @@ use std::{
 
 use axum::{
     Extension, Router,
-    extract::{FromRef, Request, State},
+    extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
-use axum_client_addr::{ClientIp, ClientIpConfig};
+use axum_client_addr::{ClientIp, ClientIpConfig, ClientIpConfigSource};
 use governor::{DefaultKeyedRateLimiter, Quota};
 
 #[derive(Clone)]
@@ -21,9 +21,12 @@ struct AppState {
     rate_limiter:     Arc<DefaultKeyedRateLimiter<IpAddr>>,
 }
 
-impl FromRef<AppState> for ClientIpConfig {
-    fn from_ref(state: &AppState) -> Self {
-        state.client_ip_config.clone()
+// ClientIp reads this config by reference through ClientIpConfigSource.
+// Using axum's FromRef<AppState> would create an owned ClientIpConfig for each request, cloning the proxy rules even though the extractor only needs to read them.
+impl ClientIpConfigSource for AppState {
+    #[inline]
+    fn client_ip_config(&self) -> &ClientIpConfig {
+        &self.client_ip_config
     }
 }
 
