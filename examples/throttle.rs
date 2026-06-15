@@ -18,7 +18,7 @@ use governor::{DefaultKeyedRateLimiter, Quota};
 #[derive(Clone)]
 struct AppState {
     client_ip_config: ClientIpConfig,
-    rate_limiter: Arc<DefaultKeyedRateLimiter<IpAddr>>,
+    rate_limiter:     Arc<DefaultKeyedRateLimiter<IpAddr>>,
 }
 
 impl FromRef<AppState> for ClientIpConfig {
