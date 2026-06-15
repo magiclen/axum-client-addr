@@ -15,7 +15,7 @@ If no trusted header gives a valid IP, the resolver falls back to the socket pee
 
 ## Example
 
-```rust,no_run
+```rust
 use std::net::SocketAddr;
 
 use axum::{Router, http::HeaderName, routing::get};
