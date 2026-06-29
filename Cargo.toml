@@ -1,6 +1,6 @@
 [package]
 name = "axum-client-addr"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Magic Len <len@magiclen.org>"]
 edition = "2024"
 rust-version = "1.85"
@@ -10,7 +10,7 @@ keywords = ["axum", "proxy", "client", "ip", "http"]
 categories = ["web-programming"]
 description = "Resolve client IP addresses in `axum` from trusted proxy headers with safe socket fallback."
 license = "MIT"
-include = ["src/**/*", "examples/**/*", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
