@@ -6,8 +6,9 @@ use axum::{
 };
 
 use crate::{
-    ChainHeader, ClientIpConfig, ClientIpConfigSource, ClientIpRejection, TrustAllChainIpSelection,
-    TrustAllProxyMode,
+    ChainHeader, ClientIpConfig, ClientIpConfigSource,
+    ClientIpRejection::{self, MissingConnectInfo},
+    TrustAllChainIpSelection, TrustAllProxyMode,
     headers::{configured_client_ip_header, forwarded_ips, list_header_ips, x_forwarded_for_ips},
 };
 
@@ -70,11 +71,9 @@ where
     type Rejection = ClientIpRejection;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let socket_addr = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|connect_info| connect_info.0)
-            .ok_or(ClientIpRejection::MissingConnectInfo)?;
+        let ConnectInfo(socket_addr) = ConnectInfo::<SocketAddr>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| MissingConnectInfo)?;
 
         Ok(resolve_client_ip(&parts.headers, socket_addr, state.client_ip_config()))
     }
