@@ -1,4 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 use axum::{
     extract::{ConnectInfo, FromRequestParts},
@@ -9,11 +12,12 @@ use crate::{
     ChainHeader, ClientIpConfig, ClientIpConfigSource,
     ClientIpRejection::{self, MissingConnectInfo},
     TrustAllChainIpSelection, TrustAllProxyMode,
-    headers::{configured_client_ip_header, forwarded_ips, list_header_ips, x_forwarded_for_ips},
+    config::ChainHeaderKind,
+    headers::{ChainEntry, configured_client_ip_header, forwarded_entries, list_header_entries},
 };
 
 /// The resolved client IP and the source that produced it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ClientIp {
     ip:     IpAddr,
     source: ClientIpSource,
@@ -39,10 +43,30 @@ impl ClientIp {
     pub const fn source(&self) -> &ClientIpSource {
         &self.source
     }
+
+    /// Consume this value and return the client IP and its source.
+    #[inline]
+    pub fn into_parts(self) -> (IpAddr, ClientIpSource) {
+        (self.ip, self.source)
+    }
+}
+
+impl fmt::Display for ClientIp {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.ip, f)
+    }
+}
+
+impl From<ClientIp> for IpAddr {
+    #[inline]
+    fn from(client_ip: ClientIp) -> Self {
+        client_ip.ip
+    }
 }
 
 /// The data source used to resolve a [`ClientIp`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ClientIpSource {
     /// The configured client IP header for the matched trusted proxy.
     ///
@@ -82,7 +106,6 @@ where
 /// Resolve the client IP from request headers, socket address, and config.
 ///
 /// See the crate-level docs for the full resolution order.
-#[inline]
 pub fn resolve_client_ip(
     headers: &HeaderMap,
     socket_addr: SocketAddr,
@@ -133,11 +156,14 @@ fn client_ip_from_chain_headers(
     headers: &HeaderMap,
     config: &ClientIpConfig,
 ) -> Option<(IpAddr, ClientIpSource)> {
-    for chain_header in config.chain_header_order() {
-        let ips = chain_header_ips(headers, chain_header);
+    let mut entries = Vec::new();
+
+    // This path only runs in CIDR mode, so read the field directly instead of the mode-aware getter.
+    for chain_header in &config.chain_header_order {
+        chain_header_entries(headers, chain_header, &mut entries);
 
         // Scan from the socket side toward the original client.
-        let Some(ip) = first_non_trusted_from_right(&ips, config) else {
+        let Some(ip) = first_non_trusted_from_right(&entries, config) else {
             continue;
         };
 
@@ -151,9 +177,12 @@ fn client_ip_from_trust_all_chain_headers(
     headers: &HeaderMap,
     mode: &TrustAllProxyMode,
 ) -> Option<(IpAddr, ClientIpSource)> {
+    let mut entries = Vec::new();
+
     for chain_header in mode.chain_header_order() {
-        let ips = chain_header_ips(headers, chain_header);
-        let Some(ip) = select_trust_all_chain_ip(&ips, mode.chain_ip_selection()) else {
+        chain_header_entries(headers, chain_header, &mut entries);
+
+        let Some(ip) = select_trust_all_chain_ip(&entries, mode.chain_ip_selection()) else {
             continue;
         };
 
@@ -163,35 +192,57 @@ fn client_ip_from_trust_all_chain_headers(
     None
 }
 
-fn chain_header_ips(headers: &HeaderMap, chain_header: &ChainHeader) -> Vec<IpAddr> {
-    match chain_header.as_header_name().as_str() {
-        "x-forwarded-for" => x_forwarded_for_ips(headers),
-        "forwarded" => forwarded_ips(headers),
-        _ => list_header_ips(headers, chain_header.as_header_name()),
+fn chain_header_entries(
+    headers: &HeaderMap,
+    chain_header: &ChainHeader,
+    entries: &mut Vec<ChainEntry>,
+) {
+    entries.clear();
+
+    let header = chain_header.as_header_name();
+
+    match chain_header.kind() {
+        ChainHeaderKind::Forwarded => forwarded_entries(headers, header, entries),
+        ChainHeaderKind::XForwardedFor | ChainHeaderKind::List => {
+            list_header_entries(headers, header, entries)
+        },
     }
 }
 
 fn chain_header_source(chain_header: &ChainHeader) -> ClientIpSource {
-    let header = chain_header.as_header_name();
-
-    match header.as_str() {
-        "x-forwarded-for" => ClientIpSource::XForwardedFor,
-        "forwarded" => ClientIpSource::Forwarded,
-        _ => ClientIpSource::List(header.clone()),
+    match chain_header.kind() {
+        ChainHeaderKind::XForwardedFor => ClientIpSource::XForwardedFor,
+        ChainHeaderKind::Forwarded => ClientIpSource::Forwarded,
+        ChainHeaderKind::List => ClientIpSource::List(chain_header.as_header_name().clone()),
     }
 }
 
 fn select_trust_all_chain_ip(
-    ips: &[IpAddr],
+    entries: &[ChainEntry],
     selection: TrustAllChainIpSelection,
 ) -> Option<IpAddr> {
-    match selection {
-        TrustAllChainIpSelection::Leftmost => ips.first().copied(),
-        TrustAllChainIpSelection::Rightmost => ips.last().copied(),
+    let entry = match selection {
+        TrustAllChainIpSelection::Leftmost => entries.first(),
+        TrustAllChainIpSelection::Rightmost => entries.last(),
+    }?;
+
+    match entry {
+        ChainEntry::Ip(ip) => Some(*ip),
+        ChainEntry::Opaque => None,
     }
 }
 
 #[inline]
-fn first_non_trusted_from_right(ips: &[IpAddr], config: &ClientIpConfig) -> Option<IpAddr> {
-    ips.iter().rev().copied().find(|ip| !config.is_trusted_proxy(*ip))
+fn first_non_trusted_from_right(entries: &[ChainEntry], config: &ClientIpConfig) -> Option<IpAddr> {
+    for entry in entries.iter().rev() {
+        match entry {
+            // Keep walking left past hops that are known trusted proxies.
+            ChainEntry::Ip(ip) if config.is_trusted_proxy(*ip) => continue,
+            ChainEntry::Ip(ip) => return Some(*ip),
+            // This hop cannot be checked against the trusted proxy rules, so nothing further left can be trusted either.
+            ChainEntry::Opaque => return None,
+        }
+    }
+
+    None
 }

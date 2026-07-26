@@ -9,7 +9,9 @@ By default, this crate does not trust any proxy header and returns the socket pe
 
 If it is trusted, a configured single-IP header, such as `X-Real-IP`, is read first. If that header is missing or invalid, the configured chain headers are checked in order, such as `X-Forwarded-For` or `Forwarded`.
 
-In trust-all mode, every socket peer is treated as trusted and the same header order is used without a CIDR check.
+A chain header is scanned from the socket side toward the original client, and the first hop that is not another trusted proxy becomes the client IP. A hop that carries no usable IP address, such as `unknown` or an RFC 7239 obfuscated identifier, stops that scan, because it cannot be checked against the trusted proxy rules.
+
+In trust-all mode, every socket peer is treated as trusted and the same header order is used without a CIDR check. The leftmost or rightmost hop is taken instead of scanning, and the chain header is skipped when that hop carries no usable IP address.
 
 If no trusted header gives a valid IP, the resolver falls back to the socket peer IP.
 

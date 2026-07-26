@@ -98,6 +98,58 @@ fn custom_chain_order_changes_header_priority() {
 }
 
 #[test]
+fn trusted_proxy_stops_at_an_opaque_hop() {
+    let config = ClientIpConfig::builder().proxy(cidr("10.0.0.0/24")).build().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10, unknown, 10.0.0.2"));
+
+    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+
+    assert_eq!(ip("10.0.0.2"), client_ip.ip());
+    assert_eq!(&ClientIpSource::Socket, client_ip.source());
+}
+
+#[test]
+fn trusted_proxy_disable_chain_headers_falls_back_to_socket() {
+    let config = ClientIpConfig::builder()
+        .proxy(cidr("10.0.0.0/24"))
+        .disable_chain_headers()
+        .build()
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+
+    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+
+    assert_eq!(ip("10.0.0.2"), client_ip.ip());
+    assert_eq!(&ClientIpSource::Socket, client_ip.source());
+}
+
+#[test]
+fn trust_all_defaults_to_leftmost_x_forwarded_for() {
+    let config = ClientIpConfig::builder().trust_all_proxies().build().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10, 198.51.100.7"));
+
+    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+
+    assert_eq!(ip("203.0.113.10"), client_ip.ip());
+    assert_eq!(&ClientIpSource::XForwardedFor, client_ip.source());
+}
+
+#[test]
+fn trust_all_skips_a_chain_header_with_an_opaque_selected_hop() {
+    let config = ClientIpConfig::builder().trust_all_proxies().build().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", HeaderValue::from_static("unknown, 203.0.113.10"));
+
+    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+
+    assert_eq!(ip("10.0.0.2"), client_ip.ip());
+    assert_eq!(&ClientIpSource::Socket, client_ip.source());
+}
+
+#[test]
 fn trust_all_uses_custom_single_ip_header() {
     let header = HeaderName::from_static("x-client-ip");
     let config = ClientIpConfig::builder()

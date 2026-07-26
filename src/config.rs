@@ -42,9 +42,14 @@ impl ClientIpConfig {
     }
 
     /// Return the chain headers that are checked after configured headers.
+    ///
+    /// In trust-all mode this returns the trust-all chain header order, because that is the order actually in use.
     #[inline]
     pub fn chain_header_order(&self) -> &[ChainHeader] {
-        &self.chain_header_order
+        match &self.trust_all_mode {
+            Some(mode) => &mode.chain_header_order,
+            None => &self.chain_header_order,
+        }
     }
 
     /// Return the trust-all proxy mode, if it is enabled.
@@ -101,11 +106,14 @@ impl Default for ClientIpConfig {
 /// Builder for [`ClientIpConfig`].
 ///
 /// CIDR proxy rules and trust-all proxy mode are separate modes. They cannot be combined in one config.
+///
+/// Trust-all proxy mode is enabled only by [`Self::trust_all_proxies`] or [`Self::trust_all_proxies_with_client_ip_header`]. The other `trust_all_` methods only adjust its settings.
 #[derive(Clone, Debug)]
 pub struct ClientIpConfigBuilder {
     rules:              Vec<TrustedProxyRule>,
     chain_header_order: Vec<ChainHeader>,
-    trust_all_mode:     Option<TrustAllProxyMode>,
+    trust_all_enabled:  bool,
+    trust_all_mode:     TrustAllProxyMode,
 }
 
 impl ClientIpConfigBuilder {
@@ -127,7 +135,7 @@ impl ClientIpConfigBuilder {
     ///
     /// Use this when the proxy rewrites the original client address into one plain IP header. Common examples are `X-Real-IP`, `CF-Connecting-IP`, and `True-Client-IP`.
     ///
-    /// The header is read only when the socket peer IP is inside this CIDR. If the header is missing or invalid, chain header fallback may still run.
+    /// The header is read only when the socket peer IP is inside this CIDR. If the header is missing or invalid, chain header fallback may still run, so the proxy should also clear or overwrite the chain headers it does not set itself.
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
     pub fn proxy_with_client_ip_header(mut self, cidr: IpCidr, header: HeaderName) -> Self {
@@ -167,7 +175,7 @@ impl ClientIpConfigBuilder {
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
     pub fn trust_all_proxies(mut self) -> Self {
-        self.ensure_trust_all_mode();
+        self.trust_all_enabled = true;
         self
     }
 
@@ -177,28 +185,33 @@ impl ClientIpConfigBuilder {
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
     pub fn trust_all_proxies_with_client_ip_header(mut self, header: HeaderName) -> Self {
-        self.ensure_trust_all_mode().client_ip_header = Some(header);
+        self.trust_all_enabled = true;
+        self.trust_all_mode.client_ip_header = Some(header);
         self
     }
 
     /// Set how trust-all mode selects an IP from a chain header.
+    ///
+    /// This only adjusts a setting. Trust-all proxy mode must still be enabled by [`Self::trust_all_proxies`] or [`Self::trust_all_proxies_with_client_ip_header`], otherwise [`Self::build`] fails.
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
     pub fn trust_all_chain_ip_selection(mut self, selection: TrustAllChainIpSelection) -> Self {
-        self.ensure_trust_all_mode().chain_ip_selection = selection;
+        self.trust_all_mode.chain_ip_selection = selection;
         self
     }
 
     /// Set the chain header order used by trust-all proxy mode.
     ///
     /// Use [`ChainHeader::new`] for a custom comma-separated IP list header.
+    ///
+    /// This only adjusts a setting. Trust-all proxy mode must still be enabled by [`Self::trust_all_proxies`] or [`Self::trust_all_proxies_with_client_ip_header`], otherwise [`Self::build`] fails.
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
     pub fn trust_all_chain_header_order(
         mut self,
         order: impl IntoIterator<Item = ChainHeader>,
     ) -> Self {
-        self.ensure_trust_all_mode().chain_header_order = order.into_iter().collect();
+        self.trust_all_mode.chain_header_order = order.into_iter().collect();
         self
     }
 
@@ -206,34 +219,34 @@ impl ClientIpConfigBuilder {
     ///
     /// CIDRs with the same metadata are merged. CIDRs with different metadata must not overlap, because one socket IP would then imply two policies.
     pub fn build(self) -> Result<ClientIpConfig, ClientIpConfigBuildError> {
-        if self.trust_all_mode.is_some() && !self.rules.is_empty() {
-            return Err(ClientIpConfigBuildError::TrustAllProxyModeWithTrustedProxyRules);
+        if self.trust_all_enabled {
+            if !self.rules.is_empty() {
+                return Err(ClientIpConfigBuildError::TrustAllProxyModeWithTrustedProxyRules);
+            }
+        } else if self.trust_all_mode != TrustAllProxyMode::default() {
+            // Silently dropping these settings would hide a mistake in a security-sensitive option.
+            return Err(ClientIpConfigBuildError::TrustAllProxySettingsWithoutTrustAllProxyMode);
         }
 
         ensure_no_cross_metadata_overlap(&self.rules)?;
 
         let mut trusted_proxies = merge_rules_by_metadata(self.rules);
 
-        // Keep the invariant clear after merging. This should already be true.
-        ensure_no_cross_metadata_overlap(&trusted_proxies)?;
+        // Merging only joins adjacent CIDRs of one metadata group, so it covers exactly the same addresses and cannot create a new cross-metadata overlap.
+        debug_assert!(ensure_no_cross_metadata_overlap(&trusted_proxies).is_ok());
 
         trusted_proxies.sort_by(|a, b| {
             b.cidr
                 .network_length()
                 .cmp(&a.cidr.network_length())
-                .then_with(|| a.cidr.to_string().cmp(&b.cidr.to_string()))
+                .then_with(|| a.cidr.first_address().cmp(&b.cidr.first_address()))
         });
 
         Ok(ClientIpConfig {
             trusted_proxies,
             chain_header_order: self.chain_header_order,
-            trust_all_mode: self.trust_all_mode,
+            trust_all_mode: self.trust_all_enabled.then_some(self.trust_all_mode),
         })
-    }
-
-    #[inline]
-    fn ensure_trust_all_mode(&mut self) -> &mut TrustAllProxyMode {
-        self.trust_all_mode.get_or_insert_with(TrustAllProxyMode::default)
     }
 }
 
@@ -242,7 +255,8 @@ impl Default for ClientIpConfigBuilder {
         Self {
             rules:              Vec::new(),
             chain_header_order: vec![ChainHeader::x_forwarded_for(), ChainHeader::forwarded()],
-            trust_all_mode:     None,
+            trust_all_enabled:  false,
+            trust_all_mode:     TrustAllProxyMode::default(),
         }
     }
 }
@@ -288,12 +302,16 @@ impl Default for TrustAllProxyMode {
 }
 
 /// How trust-all proxy mode selects an IP from a chain header.
+///
+/// Either end can only be trusted as far as the proxy in front of the service is trusted. If the selected hop carries no usable IP address, the chain header is skipped.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TrustAllChainIpSelection {
-    /// Use the first valid IP in the chain.
+    /// Use the first hop in the chain.
+    ///
+    /// This is the usual `X-Forwarded-For` meaning, but the leftmost value is also the part a client can write freely. It is safe only when the proxy in front of the service overwrites or clears the header.
     Leftmost,
 
-    /// Use the last valid IP in the chain.
+    /// Use the last hop in the chain.
     Rightmost,
 }
 
@@ -360,7 +378,7 @@ impl TrustedProxyRule {
 
     /// Create a trusted proxy rule with a configured client IP header.
     ///
-    /// Use this when this proxy emits a trusted single-value client IP header. The header is read only for socket peers inside this rule's CIDR.
+    /// Use this when this proxy emits a trusted single-value client IP header. The header is read only for socket peers inside this rule's CIDR. If the header is missing or invalid, chain header fallback may still run, so the proxy should also clear or overwrite the chain headers it does not set itself.
     #[inline]
     pub const fn with_client_ip_header(cidr: IpCidr, header: HeaderName) -> Self {
         Self {
@@ -400,39 +418,71 @@ impl TrustedProxyRule {
 /// A chain header that may contain client and proxy IP addresses.
 ///
 /// `X-Forwarded-For` is parsed as a comma-separated IP list. `Forwarded` is parsed using the standard `Forwarded` header syntax. Other header names are parsed as custom comma-separated IP list headers.
+///
+/// The parsing style is decided once, when the chain header is created, from the header name.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ChainHeader(HeaderName);
+pub struct ChainHeader {
+    name: HeaderName,
+    kind: ChainHeaderKind,
+}
+
+/// How the value of a chain header is parsed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ChainHeaderKind {
+    XForwardedFor,
+    Forwarded,
+    List,
+}
 
 impl ChainHeader {
     /// Create a chain header from a header name.
     ///
-    /// Use this for custom headers that contain `X-Forwarded-For` style comma-separated IP lists.
+    /// Use this for custom headers that contain `X-Forwarded-For` style comma-separated IP lists. The names `x-forwarded-for` and `forwarded` still get their dedicated parsing.
     #[inline]
-    pub const fn new(header: HeaderName) -> Self {
-        Self(header)
+    pub fn new(header: HeaderName) -> Self {
+        let kind = match header.as_str() {
+            "x-forwarded-for" => ChainHeaderKind::XForwardedFor,
+            "forwarded" => ChainHeaderKind::Forwarded,
+            _ => ChainHeaderKind::List,
+        };
+
+        Self {
+            name: header,
+            kind,
+        }
     }
 
     /// Create the `X-Forwarded-For` chain header.
     #[inline]
     pub const fn x_forwarded_for() -> Self {
-        Self(HeaderName::from_static("x-forwarded-for"))
+        Self {
+            name: HeaderName::from_static("x-forwarded-for"),
+            kind: ChainHeaderKind::XForwardedFor,
+        }
     }
 
     /// Create the standard `Forwarded` chain header.
     #[inline]
     pub const fn forwarded() -> Self {
-        Self(HeaderName::from_static("forwarded"))
+        Self {
+            name: HeaderName::from_static("forwarded"), kind: ChainHeaderKind::Forwarded
+        }
     }
 
     /// Return the wrapped header name.
     #[inline]
     pub const fn as_header_name(&self) -> &HeaderName {
-        &self.0
+        &self.name
     }
 
     /// Consume this chain header and return the wrapped header name.
     #[inline]
     pub fn into_header_name(self) -> HeaderName {
-        self.0
+        self.name
+    }
+
+    #[inline]
+    pub(crate) const fn kind(&self) -> ChainHeaderKind {
+        self.kind
     }
 }

@@ -1,9 +1,20 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    borrow::Cow,
+    net::{IpAddr, SocketAddr},
+};
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName};
 
-const X_FORWARDED_FOR: &str = "x-forwarded-for";
-const FORWARDED: &str = "forwarded";
+/// One hop found in a chain header.
+pub(crate) enum ChainEntry {
+    /// A hop with a usable IP address.
+    Ip(IpAddr),
+
+    /// A hop that exists but carries no usable IP address.
+    ///
+    /// This covers `unknown`, RFC 7239 obfuscated identifiers, unparsable text, and `Forwarded` elements without a `for` parameter. Such a hop cannot be checked against the trusted proxy rules.
+    Opaque,
+}
 
 pub(crate) fn configured_client_ip_header(
     headers: &HeaderMap,
@@ -16,110 +27,151 @@ pub(crate) fn configured_client_ip_header(
         .find_map(|raw| raw.trim().parse::<IpAddr>().ok())
 }
 
-#[inline]
-pub(crate) fn x_forwarded_for_ips(headers: &HeaderMap) -> Vec<IpAddr> {
-    ip_list_header_values(headers.get_all(X_FORWARDED_FOR).iter())
-}
-
-#[inline]
-pub(crate) fn list_header_ips(headers: &HeaderMap, header: &HeaderName) -> Vec<IpAddr> {
-    ip_list_header_values(headers.get_all(header).iter())
-}
-
-fn ip_list_header_values<'a>(values: impl Iterator<Item = &'a HeaderValue>) -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-
-    for value in values {
+/// Collect the hops of an `X-Forwarded-For` style comma-separated header.
+pub(crate) fn list_header_entries(
+    headers: &HeaderMap,
+    header: &HeaderName,
+    entries: &mut Vec<ChainEntry>,
+) {
+    for value in headers.get_all(header).iter() {
         let Ok(raw) = value.to_str() else {
+            // A non-UTF-8 value hides at least one hop.
+            entries.push(ChainEntry::Opaque);
             continue;
         };
 
         for part in raw.split(',') {
-            if let Some(ip) = parse_ip_like(part) {
-                ips.push(ip);
+            let part = part.trim();
+
+            // An empty part is list punctuation, not a hop.
+            if part.is_empty() {
+                continue;
             }
+
+            entries.push(chain_entry(part));
         }
     }
-
-    ips
 }
 
-#[inline]
-pub(crate) fn forwarded_ips(headers: &HeaderMap) -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-
-    for value in headers.get_all(FORWARDED).iter() {
+/// Collect the hops of a standard `Forwarded` header.
+pub(crate) fn forwarded_entries(
+    headers: &HeaderMap,
+    header: &HeaderName,
+    entries: &mut Vec<ChainEntry>,
+) {
+    for value in headers.get_all(header).iter() {
         let Ok(raw) = value.to_str() else {
+            entries.push(ChainEntry::Opaque);
             continue;
         };
 
-        for element in split_quoted(raw, ',') {
-            for pair in split_quoted(element, ';') {
-                let Some((name, value)) = pair.split_once('=') else {
-                    continue;
-                };
+        for element in SplitQuoted::new(raw, ',') {
+            if element.is_empty() {
+                continue;
+            }
 
-                if !name.trim().eq_ignore_ascii_case("for") {
-                    continue;
-                }
+            entries.push(forwarded_element_entry(element));
+        }
+    }
+}
 
-                let value = unquote_http_quoted_string(value.trim());
+fn forwarded_element_entry(element: &str) -> ChainEntry {
+    for pair in SplitQuoted::new(element, ';') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
 
-                if let Some(ip) = parse_ip_like(&value) {
-                    ips.push(ip);
-                }
+        if !name.trim().eq_ignore_ascii_case("for") {
+            continue;
+        }
 
-                break;
+        return chain_entry(&unquote_http_quoted_string(value.trim()));
+    }
+
+    ChainEntry::Opaque
+}
+
+#[inline]
+fn chain_entry(raw: &str) -> ChainEntry {
+    match parse_ip_like(raw) {
+        Some(ip) => ChainEntry::Ip(ip),
+        None => ChainEntry::Opaque,
+    }
+}
+
+/// Split by a delimiter, but ignore delimiters inside HTTP quoted strings.
+///
+/// Every item is trimmed, and an empty input yields one empty item.
+struct SplitQuoted<'a> {
+    input:     &'a str,
+    delimiter: char,
+    start:     Option<usize>,
+}
+
+impl<'a> SplitQuoted<'a> {
+    #[inline]
+    const fn new(input: &'a str, delimiter: char) -> Self {
+        Self {
+            input,
+            delimiter,
+            start: Some(0),
+        }
+    }
+}
+
+impl<'a> Iterator for SplitQuoted<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let start = self.start?;
+        let mut in_quotes = false;
+        let mut escaped = false;
+
+        for (offset, ch) in self.input[start..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+
+            if in_quotes && ch == '\\' {
+                escaped = true;
+                continue;
+            }
+
+            if ch == '"' {
+                in_quotes = !in_quotes;
+                continue;
+            }
+
+            if ch == self.delimiter && !in_quotes {
+                let end = start + offset;
+
+                self.start = Some(end + ch.len_utf8());
+
+                return Some(self.input[start..end].trim());
             }
         }
+
+        self.start = None;
+
+        Some(self.input[start..].trim())
     }
-
-    ips
-}
-
-// Split by a delimiter, but ignore delimiters inside HTTP quoted strings.
-#[inline]
-fn split_quoted(input: &str, delimiter: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut in_quotes = false;
-    let mut escaped = false;
-
-    for (idx, ch) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        if in_quotes && ch == '\\' {
-            escaped = true;
-            continue;
-        }
-
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            continue;
-        }
-
-        if ch == delimiter && !in_quotes {
-            parts.push(input[start..idx].trim());
-            start = idx + ch.len_utf8();
-        }
-    }
-
-    parts.push(input[start..].trim());
-    parts
 }
 
 #[inline]
-fn unquote_http_quoted_string(input: &str) -> String {
+fn unquote_http_quoted_string(input: &str) -> Cow<'_, str> {
     let input = input.trim();
 
     if input.len() < 2 || !input.starts_with('"') || !input.ends_with('"') {
-        return input.to_string();
+        return Cow::Borrowed(input);
     }
 
     let inner = &input[1..input.len() - 1];
+
+    if !inner.contains('\\') {
+        return Cow::Borrowed(inner);
+    }
+
     let mut output = String::with_capacity(inner.len());
     let mut escaped = false;
 
@@ -138,7 +190,7 @@ fn unquote_http_quoted_string(input: &str) -> String {
         output.push(ch);
     }
 
-    output
+    Cow::Owned(output)
 }
 
 #[inline]
