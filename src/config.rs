@@ -6,6 +6,7 @@ use cidr::IpCidr;
 use crate::{
     ClientIpConfigBuildError,
     cidr_merge::{ensure_no_cross_metadata_overlap, merge_rules_by_metadata},
+    headers::canonical_ip,
 };
 
 /// Settings used to resolve a client IP from a request.
@@ -17,13 +18,13 @@ use crate::{
 /// * Trust all proxies: every socket peer is treated as a trusted proxy.
 ///
 /// The default config trusts no proxy.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientIpConfig {
     pub(crate) trust: TrustModel,
 }
 
 /// The trust model that a [`ClientIpConfig`] was built with.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustModel {
     NoProxy,
     TrustedProxies {
@@ -90,6 +91,8 @@ impl ClientIpConfig {
 
     /// Check whether an IP address is treated as a trusted proxy.
     ///
+    /// An IPv4-mapped IPv6 address is matched by its IPv4 form.
+    ///
     /// This is always true in trust-all proxy mode and always false when no proxy is trusted.
     #[inline]
     pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
@@ -107,7 +110,15 @@ impl ClientIpConfig {
         match &self.trust {
             TrustModel::TrustedProxies {
                 rules, ..
-            } => rules.iter().find(|rule| rule.cidr.contains(&ip)),
+            } => {
+                let ip = canonical_ip(ip);
+
+                // The rules never overlap and are sorted by first address, so only the last rule that starts at or before this address can contain it.
+                let index = rules.partition_point(|rule| rule.cidr.first_address() <= ip);
+                let rule = &rules[index.checked_sub(1)?];
+
+                rule.cidr.contains(&ip).then_some(rule)
+            },
             TrustModel::NoProxy | TrustModel::TrustAllProxies(_) => None,
         }
     }
@@ -182,7 +193,7 @@ impl ClientIpConfigBuilder {
 /// Builder for a config that trusts proxies by CIDR.
 ///
 /// A request is resolved from headers only when its socket peer IP matches one of the added CIDRs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustedProxiesBuilder {
     rules:              Vec<TrustedProxyRule>,
     chain_header_order: Vec<ChainHeader>,
@@ -272,13 +283,8 @@ impl TrustedProxiesBuilder {
         // Merging only joins adjacent CIDRs of one metadata group, so it covers exactly the same addresses and cannot create a new cross-metadata overlap.
         debug_assert!(ensure_no_cross_metadata_overlap(&rules).is_ok());
 
-        // A more specific CIDR must win over a wider one, so sort by descending network length.
-        rules.sort_by(|a, b| {
-            b.cidr
-                .network_length()
-                .cmp(&a.cidr.network_length())
-                .then_with(|| a.cidr.first_address().cmp(&b.cidr.first_address()))
-        });
+        // Merging leaves the rules of one metadata group disjoint, and rules of different groups were already rejected if they overlapped, so no address can match two rules. Sorting by first address therefore only fixes the order that the metadata grouping left undefined, and it lets a lookup binary search instead of scanning.
+        rules.sort_by_key(|rule| rule.cidr.first_address());
 
         Ok(ClientIpConfig {
             trust: TrustModel::TrustedProxies {
@@ -559,6 +565,13 @@ impl ChainHeader {
     #[inline]
     pub(crate) const fn kind(&self) -> ChainHeaderKind {
         self.kind
+    }
+}
+
+impl From<HeaderName> for ChainHeader {
+    #[inline]
+    fn from(header: HeaderName) -> Self {
+        Self::new(header)
     }
 }
 

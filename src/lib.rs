@@ -33,7 +33,9 @@ Every hop is only as trustworthy as the proxy that wrote it. The rightmost value
 Forwarded: for=203.0.113.10, for=198.51.100.7
 ```
 
-`X-Forwarded-For` is read as a comma-separated IP list, `Forwarded` is read with the standard RFC 7239 syntax, and any other header name added through [`ChainHeader::new`] is read as a comma-separated IP list. A hop may carry a port, and an IPv6 hop may be bracketed, so `192.0.2.43:47011` and `[2001:db8::17]:4711` both work.
+`X-Forwarded-For` is read as a comma-separated IP list, `Forwarded` is read with the standard RFC 7239 syntax, and any other header name added through [`ChainHeader::new`] is read as a comma-separated IP list. A hop may carry a port, and an IPv6 hop may be bracketed, so `192.0.2.43:47011` and `[2001:db8::17]:4711` both work. A header value that is not valid UTF-8 hides an unknown number of hops, so that whole chain header is skipped and the next one is tried.
+
+IPv4-mapped IPv6 addresses, such as `::ffff:203.0.113.10`, are normalized to their IPv4 form. This covers the socket peer IP as well as every header value, so a service on a dual-stack listener still matches trusted proxy CIDRs that are written in IPv4 form, and one client always resolves to one address.
 
 ## Trust models
 

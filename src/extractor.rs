@@ -13,7 +13,10 @@ use crate::{
     ClientIpRejection::{self, MissingConnectInfo},
     TrustAllChainIpSelection, TrustAllProxyMode,
     config::{ChainHeaderKind, TrustModel},
-    headers::{ChainEntry, configured_client_ip_header, forwarded_entries, list_header_entries},
+    headers::{
+        ChainEntry, canonical_ip, configured_client_ip_header, forwarded_entries,
+        list_header_entries,
+    },
 };
 
 /// The resolved client IP and the source that produced it.
@@ -115,6 +118,8 @@ impl ClientIpConfig {
     ///
     /// Use this when the request does not come from `axum`, or when the [`ClientIp`] extractor is not convenient. See the crate-level docs for the full resolution order.
     pub fn resolve_client_ip(&self, headers: &HeaderMap, peer_ip: IpAddr) -> ClientIp {
+        let peer_ip = canonical_ip(peer_ip);
+
         match &self.trust {
             TrustModel::NoProxy => ClientIp::new(peer_ip, ClientIpSource::Socket),
             TrustModel::TrustedProxies {
@@ -143,7 +148,12 @@ fn resolve_client_ip_from_trusted_proxies(
         }
     }
 
-    if let Some((ip, source)) = client_ip_from_chain_headers(headers, config, chain_header_order) {
+    // Scan from the socket side toward the original client.
+    if let Some((ip, source)) =
+        client_ip_from_chain_headers(headers, chain_header_order, |entries| {
+            first_non_trusted_from_right(entries, config)
+        })
+    {
         return ClientIp::new(ip, source);
     }
 
@@ -161,94 +171,83 @@ fn resolve_client_ip_trusting_all_proxies(
         }
     }
 
-    if let Some((ip, source)) = client_ip_from_trust_all_chain_headers(headers, mode) {
+    if let Some((ip, source)) =
+        client_ip_from_chain_headers(headers, mode.chain_header_order(), |entries| {
+            select_trust_all_chain_ip(entries, mode.chain_ip_selection())
+        })
+    {
         return ClientIp::new(ip, source);
     }
 
     ClientIp::new(socket_ip, ClientIpSource::Socket)
 }
 
+/// Try each chain header in order and return the first IP that `pick` accepts.
+///
+/// `pick` receives the hops of one chain header in left-to-right order. A header whose values cannot be read at all is skipped, as is one that `pick` rejects.
 fn client_ip_from_chain_headers(
     headers: &HeaderMap,
-    config: &ClientIpConfig,
     chain_header_order: &[ChainHeader],
+    mut pick: impl FnMut(&mut dyn DoubleEndedIterator<Item = ChainEntry>) -> Option<IpAddr>,
 ) -> Option<(IpAddr, ClientIpSource)> {
-    let mut entries = Vec::new();
+    let mut forwarded_buffer = Vec::new();
 
     for chain_header in chain_header_order {
-        chain_header_entries(headers, chain_header, &mut entries);
+        let header = chain_header.as_header_name();
 
-        // Scan from the socket side toward the original client.
-        let Some(ip) = first_non_trusted_from_right(&entries, config) else {
+        let ip = match chain_header.kind() {
+            ChainHeaderKind::Forwarded => {
+                if !forwarded_entries(headers, header, &mut forwarded_buffer) {
+                    continue;
+                }
+
+                pick(&mut forwarded_buffer.iter().copied())
+            },
+            ChainHeaderKind::XForwardedFor | ChainHeaderKind::List => {
+                let Some(mut entries) = list_header_entries(headers, header) else {
+                    continue;
+                };
+
+                pick(&mut entries)
+            },
+        };
+
+        let Some(ip) = ip else {
             continue;
         };
 
-        return Some((ip, ClientIpSource::ChainHeader(chain_header.as_header_name().clone())));
+        return Some((ip, ClientIpSource::ChainHeader(header.clone())));
     }
 
     None
-}
-
-fn client_ip_from_trust_all_chain_headers(
-    headers: &HeaderMap,
-    mode: &TrustAllProxyMode,
-) -> Option<(IpAddr, ClientIpSource)> {
-    let mut entries = Vec::new();
-
-    for chain_header in mode.chain_header_order() {
-        chain_header_entries(headers, chain_header, &mut entries);
-
-        let Some(ip) = select_trust_all_chain_ip(&entries, mode.chain_ip_selection()) else {
-            continue;
-        };
-
-        return Some((ip, ClientIpSource::ChainHeader(chain_header.as_header_name().clone())));
-    }
-
-    None
-}
-
-fn chain_header_entries(
-    headers: &HeaderMap,
-    chain_header: &ChainHeader,
-    entries: &mut Vec<ChainEntry>,
-) {
-    entries.clear();
-
-    let header = chain_header.as_header_name();
-
-    match chain_header.kind() {
-        ChainHeaderKind::Forwarded => forwarded_entries(headers, header, entries),
-        ChainHeaderKind::XForwardedFor | ChainHeaderKind::List => {
-            list_header_entries(headers, header, entries)
-        },
-    }
 }
 
 fn select_trust_all_chain_ip(
-    entries: &[ChainEntry],
+    entries: &mut dyn DoubleEndedIterator<Item = ChainEntry>,
     selection: TrustAllChainIpSelection,
 ) -> Option<IpAddr> {
     let entry = match selection {
-        TrustAllChainIpSelection::Leftmost => entries.first(),
-        TrustAllChainIpSelection::Rightmost => entries.last(),
+        TrustAllChainIpSelection::Leftmost => entries.next(),
+        TrustAllChainIpSelection::Rightmost => entries.next_back(),
         // Counting is positional, so a hop without a usable IP address still takes one place.
-        TrustAllChainIpSelection::SkipRightmostHops(hops) => entries.iter().rev().nth(hops),
+        TrustAllChainIpSelection::SkipRightmostHops(hops) => entries.nth_back(hops),
     }?;
 
     match entry {
-        ChainEntry::Ip(ip) => Some(*ip),
+        ChainEntry::Ip(ip) => Some(ip),
         ChainEntry::Opaque => None,
     }
 }
 
-#[inline]
-fn first_non_trusted_from_right(entries: &[ChainEntry], config: &ClientIpConfig) -> Option<IpAddr> {
-    for entry in entries.iter().rev() {
+fn first_non_trusted_from_right(
+    entries: &mut dyn DoubleEndedIterator<Item = ChainEntry>,
+    config: &ClientIpConfig,
+) -> Option<IpAddr> {
+    while let Some(entry) = entries.next_back() {
         match entry {
             // Keep walking left past hops that are known trusted proxies.
-            ChainEntry::Ip(ip) if config.is_trusted_proxy(*ip) => continue,
-            ChainEntry::Ip(ip) => return Some(*ip),
+            ChainEntry::Ip(ip) if config.is_trusted_proxy(ip) => continue,
+            ChainEntry::Ip(ip) => return Some(ip),
             // This hop cannot be checked against the trusted proxy rules, so nothing further left can be trusted either.
             ChainEntry::Opaque => return None,
         }

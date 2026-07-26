@@ -6,6 +6,7 @@ use std::{
 use axum::http::{HeaderMap, HeaderName};
 
 /// One hop found in a chain header.
+#[derive(Clone, Copy)]
 pub(crate) enum ChainEntry {
     /// A hop with a usable IP address.
     Ip(IpAddr),
@@ -18,55 +19,56 @@ pub(crate) enum ChainEntry {
 
 /// Read the single IP address of a configured client IP header.
 ///
-/// The last usable value wins, because a proxy that appends instead of overwriting puts its own value after anything the client sent.
+/// Only the last value is read, because a proxy that appends instead of overwriting puts its own value after anything the client sent. A last value that is not a plain IP address makes the whole header unusable, so an earlier client-written value can never win.
 pub(crate) fn configured_client_ip_header(
     headers: &HeaderMap,
     header: &HeaderName,
 ) -> Option<IpAddr> {
-    headers
-        .get_all(header)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .filter_map(|raw| raw.trim().parse::<IpAddr>().ok())
-        .next_back()
+    let raw = headers.get_all(header).iter().next_back()?.to_str().ok()?;
+
+    Some(canonical_ip(raw.trim().parse::<IpAddr>().ok()?))
 }
 
-/// Collect the hops of an `X-Forwarded-For` style comma-separated header.
-pub(crate) fn list_header_entries(
-    headers: &HeaderMap,
-    header: &HeaderName,
-    entries: &mut Vec<ChainEntry>,
-) {
-    for value in headers.get_all(header).iter() {
-        let Ok(raw) = value.to_str() else {
-            // A non-UTF-8 value hides at least one hop.
-            entries.push(ChainEntry::Opaque);
-            continue;
-        };
+/// Iterate the hops of an `X-Forwarded-For` style comma-separated header, from left to right.
+///
+/// Returns [`None`] when a value is not UTF-8, because such a value hides an unknown number of hops and would shift every position in the chain.
+pub(crate) fn list_header_entries<'a>(
+    headers: &'a HeaderMap,
+    header: &'a HeaderName,
+) -> Option<impl DoubleEndedIterator<Item = ChainEntry> + 'a> {
+    let values = headers.get_all(header);
 
-        for part in raw.split(',') {
-            let part = part.trim();
-
-            // An empty part is list punctuation, not a hop.
-            if part.is_empty() {
-                continue;
-            }
-
-            entries.push(chain_entry(part));
-        }
+    if values.iter().any(|value| value.to_str().is_err()) {
+        return None;
     }
+
+    Some(
+        values
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|raw| raw.split(','))
+            .map(str::trim)
+            // An empty part is list punctuation, not a hop.
+            .filter(|part| !part.is_empty())
+            .map(chain_entry),
+    )
 }
 
-/// Collect the hops of a standard `Forwarded` header.
+/// Collect the hops of a standard `Forwarded` header into `entries`, from left to right.
+///
+/// The `Forwarded` syntax cannot be scanned backwards, so its hops are buffered instead of iterated lazily.
+///
+/// Returns `false` when a value is not UTF-8, for the same reason as [`list_header_entries`].
 pub(crate) fn forwarded_entries(
     headers: &HeaderMap,
     header: &HeaderName,
     entries: &mut Vec<ChainEntry>,
-) {
+) -> bool {
+    entries.clear();
+
     for value in headers.get_all(header).iter() {
         let Ok(raw) = value.to_str() else {
-            entries.push(ChainEntry::Opaque);
-            continue;
+            return false;
         };
 
         for element in SplitQuoted::new(raw, ',') {
@@ -77,6 +79,8 @@ pub(crate) fn forwarded_entries(
             entries.push(forwarded_element_entry(element));
         }
     }
+
+    true
 }
 
 fn forwarded_element_entry(element: &str) -> ChainEntry {
@@ -98,9 +102,17 @@ fn forwarded_element_entry(element: &str) -> ChainEntry {
 #[inline]
 fn chain_entry(raw: &str) -> ChainEntry {
     match parse_ip_like(raw) {
-        Some(ip) => ChainEntry::Ip(ip),
+        Some(ip) => ChainEntry::Ip(canonical_ip(ip)),
         None => ChainEntry::Opaque,
     }
+}
+
+/// Rewrite an IPv4-mapped IPv6 address into its IPv4 form.
+///
+/// A dual-stack listener reports IPv4 peers as `::ffff:a.b.c.d`, and some proxies write that form into their headers. Without this, an IPv4 CIDR would never match such an address.
+#[inline]
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
 }
 
 /// Split by a delimiter, but ignore delimiters inside HTTP quoted strings.
