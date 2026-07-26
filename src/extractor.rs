@@ -5,14 +5,14 @@ use std::{
 
 use axum::{
     extract::{ConnectInfo, FromRequestParts},
-    http::{HeaderMap, request::Parts},
+    http::{HeaderMap, HeaderName, request::Parts},
 };
 
 use crate::{
     ChainHeader, ClientIpConfig, ClientIpConfigSource,
     ClientIpRejection::{self, MissingConnectInfo},
     TrustAllChainIpSelection, TrustAllProxyMode,
-    config::ChainHeaderKind,
+    config::{ChainHeaderKind, TrustModel},
     headers::{ChainEntry, configured_client_ip_header, forwarded_entries, list_header_entries},
 };
 
@@ -68,24 +68,31 @@ impl From<ClientIp> for IpAddr {
 /// The data source used to resolve a [`ClientIp`].
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ClientIpSource {
-    /// The configured client IP header for the matched trusted proxy.
+    /// The single-IP header of a trusted proxy, such as `X-Real-IP`.
     ///
-    /// This means the socket peer matched a trusted proxy rule that names this header, and the header contained a plain IP address.
-    ConfiguredHeader(axum::http::HeaderName),
+    /// The contained name is the header that provided the IP.
+    ConfiguredHeader(HeaderName),
 
-    /// The `X-Forwarded-For` header.
-    XForwardedFor,
-
-    /// The standard `Forwarded` header.
-    Forwarded,
-
-    /// A custom comma-separated IP list header.
+    /// One hop of a chain header, such as `X-Forwarded-For` or `Forwarded`.
     ///
-    /// The contained header name is the source header that provided the IP.
-    List(axum::http::HeaderName),
+    /// The contained name is the header that provided the IP.
+    ChainHeader(HeaderName),
 
     /// The socket peer IP address.
     Socket,
+}
+
+impl ClientIpSource {
+    /// Return the header that provided the IP, or `None` for [`Self::Socket`].
+    #[inline]
+    pub const fn header_name(&self) -> Option<&HeaderName> {
+        match self {
+            ClientIpSource::ConfiguredHeader(header) | ClientIpSource::ChainHeader(header) => {
+                Some(header)
+            },
+            ClientIpSource::Socket => None,
+        }
+    }
 }
 
 impl<S> FromRequestParts<S> for ClientIp
@@ -99,24 +106,33 @@ where
             .await
             .map_err(|_| MissingConnectInfo)?;
 
-        Ok(resolve_client_ip(&parts.headers, socket_addr, state.client_ip_config()))
+        Ok(state.client_ip_config().resolve_client_ip(&parts.headers, socket_addr.ip()))
     }
 }
 
-/// Resolve the client IP from request headers, socket address, and config.
-///
-/// See the crate-level docs for the full resolution order.
-pub fn resolve_client_ip(
-    headers: &HeaderMap,
-    socket_addr: SocketAddr,
-    config: &ClientIpConfig,
-) -> ClientIp {
-    let socket_ip = socket_addr.ip();
-
-    if let Some(mode) = config.trust_all_proxy_mode() {
-        return resolve_client_ip_trusting_all_proxies(headers, socket_ip, mode);
+impl ClientIpConfig {
+    /// Resolve the client IP of a request from its headers and its socket peer IP.
+    ///
+    /// Use this when the request does not come from `axum`, or when the [`ClientIp`] extractor is not convenient. See the crate-level docs for the full resolution order.
+    pub fn resolve_client_ip(&self, headers: &HeaderMap, peer_ip: IpAddr) -> ClientIp {
+        match &self.trust {
+            TrustModel::NoProxy => ClientIp::new(peer_ip, ClientIpSource::Socket),
+            TrustModel::TrustedProxies {
+                chain_header_order, ..
+            } => resolve_client_ip_from_trusted_proxies(headers, peer_ip, self, chain_header_order),
+            TrustModel::TrustAllProxies(mode) => {
+                resolve_client_ip_trusting_all_proxies(headers, peer_ip, mode)
+            },
+        }
     }
+}
 
+fn resolve_client_ip_from_trusted_proxies(
+    headers: &HeaderMap,
+    socket_ip: IpAddr,
+    config: &ClientIpConfig,
+    chain_header_order: &[ChainHeader],
+) -> ClientIp {
     let Some(socket_proxy_rule) = config.rule_for(socket_ip) else {
         return ClientIp::new(socket_ip, ClientIpSource::Socket);
     };
@@ -127,7 +143,7 @@ pub fn resolve_client_ip(
         }
     }
 
-    if let Some((ip, source)) = client_ip_from_chain_headers(headers, config) {
+    if let Some((ip, source)) = client_ip_from_chain_headers(headers, config, chain_header_order) {
         return ClientIp::new(ip, source);
     }
 
@@ -155,11 +171,11 @@ fn resolve_client_ip_trusting_all_proxies(
 fn client_ip_from_chain_headers(
     headers: &HeaderMap,
     config: &ClientIpConfig,
+    chain_header_order: &[ChainHeader],
 ) -> Option<(IpAddr, ClientIpSource)> {
     let mut entries = Vec::new();
 
-    // This path only runs in CIDR mode, so read the field directly instead of the mode-aware getter.
-    for chain_header in &config.chain_header_order {
+    for chain_header in chain_header_order {
         chain_header_entries(headers, chain_header, &mut entries);
 
         // Scan from the socket side toward the original client.
@@ -167,7 +183,7 @@ fn client_ip_from_chain_headers(
             continue;
         };
 
-        return Some((ip, chain_header_source(chain_header)));
+        return Some((ip, ClientIpSource::ChainHeader(chain_header.as_header_name().clone())));
     }
 
     None
@@ -186,7 +202,7 @@ fn client_ip_from_trust_all_chain_headers(
             continue;
         };
 
-        return Some((ip, chain_header_source(chain_header)));
+        return Some((ip, ClientIpSource::ChainHeader(chain_header.as_header_name().clone())));
     }
 
     None
@@ -209,14 +225,6 @@ fn chain_header_entries(
     }
 }
 
-fn chain_header_source(chain_header: &ChainHeader) -> ClientIpSource {
-    match chain_header.kind() {
-        ChainHeaderKind::XForwardedFor => ClientIpSource::XForwardedFor,
-        ChainHeaderKind::Forwarded => ClientIpSource::Forwarded,
-        ChainHeaderKind::List => ClientIpSource::List(chain_header.as_header_name().clone()),
-    }
-}
-
 fn select_trust_all_chain_ip(
     entries: &[ChainEntry],
     selection: TrustAllChainIpSelection,
@@ -224,6 +232,8 @@ fn select_trust_all_chain_ip(
     let entry = match selection {
         TrustAllChainIpSelection::Leftmost => entries.first(),
         TrustAllChainIpSelection::Rightmost => entries.last(),
+        // Counting is positional, so a hop without a usable IP address still takes one place.
+        TrustAllChainIpSelection::SkipRightmostHops(hops) => entries.iter().rev().nth(hops),
     }?;
 
     match entry {

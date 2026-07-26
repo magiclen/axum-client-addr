@@ -33,7 +33,7 @@ impl ClientIpConfigSource for AppState {
 #[tokio::main]
 async fn main() {
     // This keeps the same address resolution behavior as the basic example: proxy headers are ignored, and the socket peer IP is the throttle key.
-    let client_ip_config = ClientIpConfig::default();
+    let client_ip_config = ClientIpConfig::builder().trust_no_proxy();
 
     // Allow each IP to send a short burst of 3 requests, then replenish one request per second. Governor applies GCRA/token-bucket-style throttling, not fixed-window request counting.
     let quota =

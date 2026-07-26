@@ -10,16 +10,27 @@ use crate::{
 
 /// Settings used to resolve a client IP from a request.
 ///
-/// In CIDR mode, the resolver first checks whether the socket peer is trusted. Headers are used only after the socket peer matches one of the trusted proxy rules. In trust-all mode, every socket peer is treated as trusted.
+/// A config always uses exactly one trust model, chosen through [`ClientIpConfig::builder`].
 ///
-/// The default config trusts no proxy and disables trust-all mode. It still stores the default chain header order, `X-Forwarded-For` then `Forwarded`, but those headers are not read unless a trusted proxy mode is enabled. With the default config, every request resolves to the socket peer IP.
+/// * Trust no proxy: every request resolves to the socket peer IP.
+/// * Trusted proxies: headers are read only after the socket peer matches one of the trusted proxy CIDRs.
+/// * Trust all proxies: every socket peer is treated as a trusted proxy.
 ///
-/// When trust-all mode is enabled without extra builder calls, it has no configured single-IP header, checks `X-Forwarded-For` before `Forwarded`, and selects the leftmost valid IP from a chain header.
+/// The default config trusts no proxy.
 #[derive(Clone, Debug)]
 pub struct ClientIpConfig {
-    pub(crate) trusted_proxies:    Vec<TrustedProxyRule>,
-    pub(crate) chain_header_order: Vec<ChainHeader>,
-    pub(crate) trust_all_mode:     Option<TrustAllProxyMode>,
+    pub(crate) trust: TrustModel,
+}
+
+/// The trust model that a [`ClientIpConfig`] was built with.
+#[derive(Clone, Debug)]
+pub(crate) enum TrustModel {
+    NoProxy,
+    TrustedProxies {
+        rules:              Vec<TrustedProxyRule>,
+        chain_header_order: Vec<ChainHeader>,
+    },
+    TrustAllProxies(TrustAllProxyMode),
 }
 
 /// Provides borrowed access to [`ClientIpConfig`] from application state.
@@ -29,50 +40,76 @@ pub trait ClientIpConfigSource {
 }
 
 impl ClientIpConfig {
-    /// Create a builder with the default chain header order.
+    /// Start building a config by choosing a trust model.
     #[inline]
-    pub fn builder() -> ClientIpConfigBuilder {
-        ClientIpConfigBuilder::default()
+    pub const fn builder() -> ClientIpConfigBuilder {
+        ClientIpConfigBuilder
     }
 
     /// Return the trusted proxy rules after build-time merging.
+    ///
+    /// This is empty unless the config was built with trusted proxy CIDRs.
     #[inline]
     pub fn trusted_proxies(&self) -> &[TrustedProxyRule] {
-        &self.trusted_proxies
-    }
-
-    /// Return the chain headers that are checked after configured headers.
-    ///
-    /// In trust-all mode this returns the trust-all chain header order, because that is the order actually in use.
-    #[inline]
-    pub fn chain_header_order(&self) -> &[ChainHeader] {
-        match &self.trust_all_mode {
-            Some(mode) => &mode.chain_header_order,
-            None => &self.chain_header_order,
+        match &self.trust {
+            TrustModel::TrustedProxies {
+                rules, ..
+            } => rules,
+            TrustModel::NoProxy | TrustModel::TrustAllProxies(_) => &[],
         }
     }
 
-    /// Return the trust-all proxy mode, if it is enabled.
+    /// Return the chain headers that are checked after the configured single-IP header.
+    ///
+    /// This is empty when the config trusts no proxy, because no header is read at all.
     #[inline]
-    pub fn trust_all_proxy_mode(&self) -> Option<&TrustAllProxyMode> {
-        self.trust_all_mode.as_ref()
+    pub fn chain_header_order(&self) -> &[ChainHeader] {
+        match &self.trust {
+            TrustModel::NoProxy => &[],
+            TrustModel::TrustedProxies {
+                chain_header_order, ..
+            } => chain_header_order,
+            TrustModel::TrustAllProxies(mode) => &mode.chain_header_order,
+        }
     }
 
-    /// Check whether trust-all proxy mode is enabled.
+    /// Return the trust-all proxy settings, if that trust model is in use.
     #[inline]
-    pub const fn trust_all_proxies(&self) -> bool {
-        self.trust_all_mode.is_some()
+    pub const fn trust_all_proxy_mode(&self) -> Option<&TrustAllProxyMode> {
+        match &self.trust {
+            TrustModel::TrustAllProxies(mode) => Some(mode),
+            _ => None,
+        }
     }
 
-    /// Check whether an IP address matches any trusted proxy rule.
+    /// Check whether this config treats every socket peer as a trusted proxy.
+    #[inline]
+    pub const fn trusts_all_proxies(&self) -> bool {
+        matches!(self.trust, TrustModel::TrustAllProxies(_))
+    }
+
+    /// Check whether an IP address is treated as a trusted proxy.
+    ///
+    /// This is always true in trust-all proxy mode and always false when no proxy is trusted.
     #[inline]
     pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
-        self.rule_for(ip).is_some()
+        match &self.trust {
+            TrustModel::NoProxy => false,
+            TrustModel::TrustedProxies {
+                ..
+            } => self.rule_for(ip).is_some(),
+            TrustModel::TrustAllProxies(_) => true,
+        }
     }
 
     #[inline]
     pub(crate) fn rule_for(&self, ip: IpAddr) -> Option<&TrustedProxyRule> {
-        self.trusted_proxies.iter().find(|rule| rule.cidr.contains(&ip))
+        match &self.trust {
+            TrustModel::TrustedProxies {
+                rules, ..
+            } => rules.iter().find(|rule| rule.cidr.contains(&ip)),
+            TrustModel::NoProxy | TrustModel::TrustAllProxies(_) => None,
+        }
     }
 }
 
@@ -94,30 +131,65 @@ where
 }
 
 impl Default for ClientIpConfig {
+    #[inline]
     fn default() -> Self {
         Self {
-            trusted_proxies:    Vec::new(),
-            chain_header_order: vec![ChainHeader::x_forwarded_for(), ChainHeader::forwarded()],
-            trust_all_mode:     None,
+            trust: TrustModel::NoProxy
         }
     }
 }
 
-/// Builder for [`ClientIpConfig`].
+/// Entry point that chooses the trust model of a [`ClientIpConfig`].
 ///
-/// CIDR proxy rules and trust-all proxy mode are separate modes. They cannot be combined in one config.
-///
-/// Trust-all proxy mode is enabled only by [`Self::trust_all_proxies`] or [`Self::trust_all_proxies_with_client_ip_header`]. The other `trust_all_` methods only adjust its settings.
-#[derive(Clone, Debug)]
-pub struct ClientIpConfigBuilder {
-    rules:              Vec<TrustedProxyRule>,
-    chain_header_order: Vec<ChainHeader>,
-    trust_all_enabled:  bool,
-    trust_all_mode:     TrustAllProxyMode,
-}
+/// The trust model decides which builder is used next, so a config can never mix trusted proxy CIDRs with trust-all proxy settings.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ClientIpConfigBuilder;
 
 impl ClientIpConfigBuilder {
     /// Create a new config builder.
+    #[inline]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Trust no proxy header and always resolve to the socket peer IP.
+    ///
+    /// This is the same as [`ClientIpConfig::default`], and needs no further building.
+    #[inline]
+    pub const fn trust_no_proxy(self) -> ClientIpConfig {
+        ClientIpConfig {
+            trust: TrustModel::NoProxy
+        }
+    }
+
+    /// Trust proxies whose socket peer IP falls inside a known CIDR.
+    ///
+    /// Use this when the proxy addresses are known ahead of time. It is the safest option, because a direct client cannot make the service read its forwarding headers.
+    #[inline]
+    pub fn trusted_proxies(self) -> TrustedProxiesBuilder {
+        TrustedProxiesBuilder::new()
+    }
+
+    /// Treat every socket peer as a trusted proxy.
+    ///
+    /// Use this when the service can only be reached through a proxy, but the proxy IP is not known ahead of time. This mode trusts forwarding headers from any socket peer, so it must not be used on a directly reachable service.
+    #[inline]
+    pub fn trust_all_proxies(self) -> TrustAllProxiesBuilder {
+        TrustAllProxiesBuilder::new()
+    }
+}
+
+/// Builder for a config that trusts proxies by CIDR.
+///
+/// A request is resolved from headers only when its socket peer IP matches one of the added CIDRs.
+#[derive(Clone, Debug)]
+pub struct TrustedProxiesBuilder {
+    rules:              Vec<TrustedProxyRule>,
+    chain_header_order: Vec<ChainHeader>,
+}
+
+impl TrustedProxiesBuilder {
+    /// Create a builder with the default chain header order.
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -126,9 +198,8 @@ impl ClientIpConfigBuilder {
     /// Add a trusted proxy CIDR without a configured client IP header.
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
-    pub fn proxy(mut self, cidr: IpCidr) -> Self {
-        self.rules.push(TrustedProxyRule::new(cidr));
-        self
+    pub fn proxy(self, cidr: IpCidr) -> Self {
+        self.proxy_rule(TrustedProxyRule::new(cidr))
     }
 
     /// Add a trusted proxy CIDR with a configured client IP header.
@@ -138,9 +209,8 @@ impl ClientIpConfigBuilder {
     /// The header is read only when the socket peer IP is inside this CIDR. If the header is missing or invalid, chain header fallback may still run, so the proxy should also clear or overwrite the chain headers it does not set itself.
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
-    pub fn proxy_with_client_ip_header(mut self, cidr: IpCidr, header: HeaderName) -> Self {
-        self.rules.push(TrustedProxyRule::with_client_ip_header(cidr, header));
-        self
+    pub fn proxy_with_client_ip_header(self, cidr: IpCidr, header: HeaderName) -> Self {
+        self.proxy_rule(TrustedProxyRule::with_client_ip_header(cidr, header))
     }
 
     /// Add a trusted proxy CIDR that sends the `X-Real-IP` header.
@@ -149,7 +219,25 @@ impl ClientIpConfigBuilder {
     #[must_use = "builder methods return an updated builder and do not mutate in place"]
     #[inline]
     pub fn proxy_with_x_real_ip(self, cidr: IpCidr) -> Self {
-        self.proxy_with_client_ip_header(cidr, HeaderName::from_static("x-real-ip"))
+        self.proxy_rule(TrustedProxyRule::with_x_real_ip(cidr))
+    }
+
+    /// Add one prepared trusted proxy rule.
+    #[must_use = "builder methods return an updated builder and do not mutate in place"]
+    #[inline]
+    pub fn proxy_rule(mut self, rule: TrustedProxyRule) -> Self {
+        self.rules.push(rule);
+        self
+    }
+
+    /// Add several prepared trusted proxy rules.
+    ///
+    /// Use this when the rules come from a config file or another runtime source.
+    #[must_use = "builder methods return an updated builder and do not mutate in place"]
+    #[inline]
+    pub fn proxies(mut self, rules: impl IntoIterator<Item = TrustedProxyRule>) -> Self {
+        self.rules.extend(rules);
+        self
     }
 
     /// Set the chain header fallback order.
@@ -169,73 +257,23 @@ impl ClientIpConfigBuilder {
         self.chain_header_order([])
     }
 
-    /// Enable trust-all proxy mode.
-    ///
-    /// Use this when the service can only be reached through a proxy, but the proxy IP is not known ahead of time. This mode trusts forwarding headers from any socket peer, so it must not be used on a directly reachable service.
-    #[must_use = "builder methods return an updated builder and do not mutate in place"]
-    #[inline]
-    pub fn trust_all_proxies(mut self) -> Self {
-        self.trust_all_enabled = true;
-        self
-    }
-
-    /// Enable trust-all proxy mode with a custom single-IP header.
-    ///
-    /// The header is checked before chain headers. It must contain one plain IP address, such as the value usually sent by `X-Real-IP`.
-    #[must_use = "builder methods return an updated builder and do not mutate in place"]
-    #[inline]
-    pub fn trust_all_proxies_with_client_ip_header(mut self, header: HeaderName) -> Self {
-        self.trust_all_enabled = true;
-        self.trust_all_mode.client_ip_header = Some(header);
-        self
-    }
-
-    /// Set how trust-all mode selects an IP from a chain header.
-    ///
-    /// This only adjusts a setting. Trust-all proxy mode must still be enabled by [`Self::trust_all_proxies`] or [`Self::trust_all_proxies_with_client_ip_header`], otherwise [`Self::build`] fails.
-    #[must_use = "builder methods return an updated builder and do not mutate in place"]
-    #[inline]
-    pub fn trust_all_chain_ip_selection(mut self, selection: TrustAllChainIpSelection) -> Self {
-        self.trust_all_mode.chain_ip_selection = selection;
-        self
-    }
-
-    /// Set the chain header order used by trust-all proxy mode.
-    ///
-    /// Use [`ChainHeader::new`] for a custom comma-separated IP list header.
-    ///
-    /// This only adjusts a setting. Trust-all proxy mode must still be enabled by [`Self::trust_all_proxies`] or [`Self::trust_all_proxies_with_client_ip_header`], otherwise [`Self::build`] fails.
-    #[must_use = "builder methods return an updated builder and do not mutate in place"]
-    #[inline]
-    pub fn trust_all_chain_header_order(
-        mut self,
-        order: impl IntoIterator<Item = ChainHeader>,
-    ) -> Self {
-        self.trust_all_mode.chain_header_order = order.into_iter().collect();
-        self
-    }
-
     /// Build an immutable config.
     ///
-    /// CIDRs with the same metadata are merged. CIDRs with different metadata must not overlap, because one socket IP would then imply two policies.
+    /// CIDRs that use the same client IP header are merged. CIDRs that use different client IP headers must not overlap, because one socket IP would then imply two policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientIpConfigBuildError::OverlappingTrustedProxyRules`] when two rules cover a common address but do not agree on the client IP header.
     pub fn build(self) -> Result<ClientIpConfig, ClientIpConfigBuildError> {
-        if self.trust_all_enabled {
-            if !self.rules.is_empty() {
-                return Err(ClientIpConfigBuildError::TrustAllProxyModeWithTrustedProxyRules);
-            }
-        } else if self.trust_all_mode != TrustAllProxyMode::default() {
-            // Silently dropping these settings would hide a mistake in a security-sensitive option.
-            return Err(ClientIpConfigBuildError::TrustAllProxySettingsWithoutTrustAllProxyMode);
-        }
-
         ensure_no_cross_metadata_overlap(&self.rules)?;
 
-        let mut trusted_proxies = merge_rules_by_metadata(self.rules);
+        let mut rules = merge_rules_by_metadata(self.rules);
 
         // Merging only joins adjacent CIDRs of one metadata group, so it covers exactly the same addresses and cannot create a new cross-metadata overlap.
-        debug_assert!(ensure_no_cross_metadata_overlap(&trusted_proxies).is_ok());
+        debug_assert!(ensure_no_cross_metadata_overlap(&rules).is_ok());
 
-        trusted_proxies.sort_by(|a, b| {
+        // A more specific CIDR must win over a wider one, so sort by descending network length.
+        rules.sort_by(|a, b| {
             b.cidr
                 .network_length()
                 .cmp(&a.cidr.network_length())
@@ -243,27 +281,83 @@ impl ClientIpConfigBuilder {
         });
 
         Ok(ClientIpConfig {
-            trusted_proxies,
-            chain_header_order: self.chain_header_order,
-            trust_all_mode: self.trust_all_enabled.then_some(self.trust_all_mode),
+            trust: TrustModel::TrustedProxies {
+                rules,
+                chain_header_order: self.chain_header_order,
+            },
         })
     }
 }
 
-impl Default for ClientIpConfigBuilder {
+impl Default for TrustedProxiesBuilder {
+    #[inline]
     fn default() -> Self {
         Self {
-            rules:              Vec::new(),
-            chain_header_order: vec![ChainHeader::x_forwarded_for(), ChainHeader::forwarded()],
-            trust_all_enabled:  false,
-            trust_all_mode:     TrustAllProxyMode::default(),
+            rules: Vec::new(), chain_header_order: default_chain_header_order()
+        }
+    }
+}
+
+/// Builder for a config that treats every socket peer as a trusted proxy.
+///
+/// This mode is useful when the service is always behind a proxy but the proxy IP is not known. It is safe only if direct client access is blocked and the proxy clears untrusted forwarding headers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrustAllProxiesBuilder {
+    mode: TrustAllProxyMode,
+}
+
+impl TrustAllProxiesBuilder {
+    /// Create a builder with the default trust-all proxy settings.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set a single-IP header that is checked before chain headers.
+    ///
+    /// It must contain one plain IP address, such as the value usually sent by `X-Real-IP`.
+    #[must_use = "builder methods return an updated builder and do not mutate in place"]
+    #[inline]
+    pub fn client_ip_header(mut self, header: HeaderName) -> Self {
+        self.mode.client_ip_header = Some(header);
+        self
+    }
+
+    /// Set the chain header fallback order.
+    ///
+    /// Use [`ChainHeader::new`] for a custom comma-separated IP list header, and an empty iterator to disable chain header fallback.
+    #[must_use = "builder methods return an updated builder and do not mutate in place"]
+    #[inline]
+    pub fn chain_header_order(mut self, order: impl IntoIterator<Item = ChainHeader>) -> Self {
+        self.mode.chain_header_order = order.into_iter().collect();
+        self
+    }
+
+    /// Disable `X-Forwarded-For` and `Forwarded` fallback.
+    #[must_use = "builder methods return an updated builder and do not mutate in place"]
+    #[inline]
+    pub fn disable_chain_headers(self) -> Self {
+        self.chain_header_order([])
+    }
+
+    /// Set which hop of a chain header becomes the client IP.
+    #[must_use = "builder methods return an updated builder and do not mutate in place"]
+    #[inline]
+    pub fn chain_ip_selection(mut self, selection: TrustAllChainIpSelection) -> Self {
+        self.mode.chain_ip_selection = selection;
+        self
+    }
+
+    /// Build an immutable config.
+    #[inline]
+    pub fn build(self) -> ClientIpConfig {
+        ClientIpConfig {
+            trust: TrustModel::TrustAllProxies(self.mode)
         }
     }
 }
 
 /// Settings used when every socket peer is treated as a trusted proxy.
-///
-/// This mode is useful when the service is always behind a proxy but the proxy IP is not known. It is safe only if direct client access is blocked or the proxy clears untrusted forwarding headers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustAllProxyMode {
     pub(crate) client_ip_header:   Option<HeaderName>,
@@ -272,19 +366,19 @@ pub struct TrustAllProxyMode {
 }
 
 impl TrustAllProxyMode {
-    /// Return the custom single-IP header checked before chain headers.
+    /// Return the single-IP header checked before chain headers.
     #[inline]
     pub const fn client_ip_header(&self) -> Option<&HeaderName> {
         self.client_ip_header.as_ref()
     }
 
-    /// Return the chain header order for trust-all mode.
+    /// Return the chain header order.
     #[inline]
     pub fn chain_header_order(&self) -> &[ChainHeader] {
         &self.chain_header_order
     }
 
-    /// Return how trust-all mode selects an IP from chain headers.
+    /// Return which hop of a chain header becomes the client IP.
     #[inline]
     pub const fn chain_ip_selection(&self) -> TrustAllChainIpSelection {
         self.chain_ip_selection
@@ -292,72 +386,62 @@ impl TrustAllProxyMode {
 }
 
 impl Default for TrustAllProxyMode {
+    #[inline]
     fn default() -> Self {
         Self {
             client_ip_header:   None,
-            chain_header_order: vec![ChainHeader::x_forwarded_for(), ChainHeader::forwarded()],
-            chain_ip_selection: TrustAllChainIpSelection::Leftmost,
+            chain_header_order: default_chain_header_order(),
+            chain_ip_selection: TrustAllChainIpSelection::Rightmost,
         }
     }
 }
 
-/// How trust-all proxy mode selects an IP from a chain header.
+/// Which hop of a chain header becomes the client IP in trust-all proxy mode.
 ///
-/// Either end can only be trusted as far as the proxy in front of the service is trusted. If the selected hop carries no usable IP address, the chain header is skipped.
+/// A hop is only as trustworthy as the proxy that wrote it. If the selected hop carries no usable IP address, the chain header is skipped.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TrustAllChainIpSelection {
     /// Use the first hop in the chain.
     ///
-    /// This is the usual `X-Forwarded-For` meaning, but the leftmost value is also the part a client can write freely. It is safe only when the proxy in front of the service overwrites or clears the header.
+    /// This is the usual `X-Forwarded-For` meaning, but the leftmost value is also the part a client can write freely. It is safe only when the proxy in front of the service overwrites or clears the header instead of appending to it.
     Leftmost,
 
     /// Use the last hop in the chain.
+    ///
+    /// A proxy that appends writes the address it received the request from, so the last hop is the one value in the chain that a client cannot choose. This is the default, and it is correct when exactly one proxy appends to the header.
     Rightmost,
+
+    /// Skip the given number of hops from the right, then use the next hop.
+    ///
+    /// Use this when a fixed number of proxies append to the header, such as a CDN in front of a load balancer. `SkipRightmostHops(0)` is the same as [`Self::Rightmost`].
+    ///
+    /// Every hop counts, including one that carries no usable IP address. The chain header is skipped when it is too short or when the selected hop is not a usable IP address.
+    SkipRightmostHops(usize),
 }
 
 /// Extra behavior attached to a trusted proxy rule.
-///
-/// Metadata can name a single header that the trusted proxy uses for the normalized client IP. That header is tied to the CIDR of the same rule.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct TrustedProxyMetadata {
-    client_ip_header: Option<HeaderName>,
+pub(crate) struct TrustedProxyMetadata {
+    pub(crate) client_ip_header: Option<HeaderName>,
 }
 
 impl TrustedProxyMetadata {
-    /// Create metadata without a configured client IP header.
     #[inline]
-    pub const fn none() -> Self {
+    pub(crate) const fn none() -> Self {
         Self {
             client_ip_header: None
         }
     }
 
-    /// Create metadata for the `X-Real-IP` header.
     #[inline]
-    pub const fn x_real_ip() -> Self {
-        Self {
-            client_ip_header: Some(HeaderName::from_static("x-real-ip"))
-        }
-    }
-
-    /// Create metadata for a custom configured client IP header.
-    ///
-    /// The header should be produced by the trusted proxy itself. It should not be a header that untrusted clients can send directly to the application.
-    #[inline]
-    pub const fn with_client_ip_header(header: HeaderName) -> Self {
+    pub(crate) const fn with_client_ip_header(header: HeaderName) -> Self {
         Self {
             client_ip_header: Some(header)
         }
     }
-
-    /// Return the configured client IP header, if one exists.
-    #[inline]
-    pub const fn client_ip_header(&self) -> Option<&HeaderName> {
-        self.client_ip_header.as_ref()
-    }
 }
 
-/// A trusted proxy CIDR and its proxy-specific metadata.
+/// A trusted proxy CIDR and the client IP header that proxy is allowed to set.
 ///
 /// The CIDR decides when this rule is active. If the rule has a configured client IP header, that header is checked before chain headers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -390,10 +474,7 @@ impl TrustedProxyRule {
     /// Create a trusted proxy rule for the `X-Real-IP` header.
     #[inline]
     pub const fn with_x_real_ip(cidr: IpCidr) -> Self {
-        Self {
-            cidr,
-            metadata: TrustedProxyMetadata::x_real_ip(),
-        }
+        Self::with_client_ip_header(cidr, HeaderName::from_static("x-real-ip"))
     }
 
     /// Return the CIDR matched by this trusted proxy rule.
@@ -402,16 +483,10 @@ impl TrustedProxyRule {
         &self.cidr
     }
 
-    /// Return the metadata attached to this trusted proxy rule.
-    #[inline]
-    pub const fn metadata(&self) -> &TrustedProxyMetadata {
-        &self.metadata
-    }
-
     /// Return the configured client IP header, if one exists.
     #[inline]
     pub const fn client_ip_header(&self) -> Option<&HeaderName> {
-        self.metadata.client_ip_header()
+        self.metadata.client_ip_header.as_ref()
     }
 }
 
@@ -485,4 +560,9 @@ impl ChainHeader {
     pub(crate) const fn kind(&self) -> ChainHeaderKind {
         self.kind
     }
+}
+
+#[inline]
+fn default_chain_header_order() -> Vec<ChainHeader> {
+    vec![ChainHeader::x_forwarded_for(), ChainHeader::forwarded()]
 }

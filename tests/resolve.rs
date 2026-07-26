@@ -1,21 +1,20 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue};
 use axum_client_addr::{
-    ChainHeader, ClientIpConfig, ClientIpSource, IpCidr, TrustAllChainIpSelection,
-    resolve_client_ip,
+    ChainHeader, ClientIpConfig, ClientIpSource, HeaderName, IpCidr, TrustAllChainIpSelection,
 };
 
 fn cidr(input: &str) -> IpCidr {
     input.parse().unwrap()
 }
 
-fn socket(ip: &str) -> SocketAddr {
-    SocketAddr::new(ip.parse::<IpAddr>().unwrap(), 12345)
-}
-
 fn ip(input: &str) -> IpAddr {
     input.parse().unwrap()
+}
+
+fn chain_header_source(name: &'static str) -> ClientIpSource {
+    ClientIpSource::ChainHeader(HeaderName::from_static(name))
 }
 
 #[test]
@@ -24,7 +23,7 @@ fn untrusted_socket_uses_socket_ip() {
     let mut headers = HeaderMap::new();
     headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("10.0.0.2"), client_ip.ip());
     assert_eq!(&ClientIpSource::Socket, client_ip.source());
@@ -32,12 +31,15 @@ fn untrusted_socket_uses_socket_ip() {
 
 #[test]
 fn trusted_proxy_uses_configured_client_ip_header() {
-    let config =
-        ClientIpConfig::builder().proxy_with_x_real_ip(cidr("10.0.0.0/24")).build().unwrap();
+    let config = ClientIpConfig::builder()
+        .trusted_proxies()
+        .proxy_with_x_real_ip(cidr("10.0.0.0/24"))
+        .build()
+        .unwrap();
     let mut headers = HeaderMap::new();
     headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.10"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("203.0.113.10"), client_ip.ip());
     assert_eq!(
@@ -47,8 +49,26 @@ fn trusted_proxy_uses_configured_client_ip_header() {
 }
 
 #[test]
+fn configured_client_ip_header_uses_the_last_value() {
+    let config = ClientIpConfig::builder()
+        .trusted_proxies()
+        .proxy_with_x_real_ip(cidr("10.0.0.0/24"))
+        .build()
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    // A client may send its own value, and a proxy that appends puts the trusted value after it.
+    headers.append("x-real-ip", HeaderValue::from_static("203.0.113.10"));
+    headers.append("x-real-ip", HeaderValue::from_static("198.51.100.7"));
+
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
+
+    assert_eq!(ip("198.51.100.7"), client_ip.ip());
+}
+
+#[test]
 fn trusted_proxy_scans_x_forwarded_for_from_the_right() {
     let config = ClientIpConfig::builder()
+        .trusted_proxies()
         .proxy(cidr("10.0.0.0/24"))
         .proxy(cidr("198.51.100.0/24"))
         .build()
@@ -59,30 +79,32 @@ fn trusted_proxy_scans_x_forwarded_for_from_the_right() {
         HeaderValue::from_static("203.0.113.10, 198.51.100.7, 10.0.0.2"),
     );
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("203.0.113.10"), client_ip.ip());
-    assert_eq!(&ClientIpSource::XForwardedFor, client_ip.source());
+    assert_eq!(&chain_header_source("x-forwarded-for"), client_ip.source());
 }
 
 #[test]
 fn trusted_proxy_reads_forwarded_header() {
-    let config = ClientIpConfig::builder().proxy(cidr("10.0.0.0/24")).build().unwrap();
+    let config =
+        ClientIpConfig::builder().trusted_proxies().proxy(cidr("10.0.0.0/24")).build().unwrap();
     let mut headers = HeaderMap::new();
     headers.insert(
         "forwarded",
         HeaderValue::from_static(r#"for="[2001:db8::17]:4711";proto=https, for=10.0.0.2"#),
     );
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("2001:db8::17"), client_ip.ip());
-    assert_eq!(&ClientIpSource::Forwarded, client_ip.source());
+    assert_eq!(&chain_header_source("forwarded"), client_ip.source());
 }
 
 #[test]
 fn custom_chain_order_changes_header_priority() {
     let config = ClientIpConfig::builder()
+        .trusted_proxies()
         .proxy(cidr("10.0.0.0/24"))
         .chain_header_order([ChainHeader::forwarded(), ChainHeader::x_forwarded_for()])
         .build()
@@ -91,19 +113,20 @@ fn custom_chain_order_changes_header_priority() {
     headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
     headers.insert("forwarded", HeaderValue::from_static("for=198.51.100.10"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("198.51.100.10"), client_ip.ip());
-    assert_eq!(&ClientIpSource::Forwarded, client_ip.source());
+    assert_eq!(&chain_header_source("forwarded"), client_ip.source());
 }
 
 #[test]
 fn trusted_proxy_stops_at_an_opaque_hop() {
-    let config = ClientIpConfig::builder().proxy(cidr("10.0.0.0/24")).build().unwrap();
+    let config =
+        ClientIpConfig::builder().trusted_proxies().proxy(cidr("10.0.0.0/24")).build().unwrap();
     let mut headers = HeaderMap::new();
     headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10, unknown, 10.0.0.2"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("10.0.0.2"), client_ip.ip());
     assert_eq!(&ClientIpSource::Socket, client_ip.source());
@@ -112,6 +135,7 @@ fn trusted_proxy_stops_at_an_opaque_hop() {
 #[test]
 fn trusted_proxy_disable_chain_headers_falls_back_to_socket() {
     let config = ClientIpConfig::builder()
+        .trusted_proxies()
         .proxy(cidr("10.0.0.0/24"))
         .disable_chain_headers()
         .build()
@@ -119,31 +143,65 @@ fn trusted_proxy_disable_chain_headers_falls_back_to_socket() {
     let mut headers = HeaderMap::new();
     headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("10.0.0.2"), client_ip.ip());
     assert_eq!(&ClientIpSource::Socket, client_ip.source());
 }
 
 #[test]
-fn trust_all_defaults_to_leftmost_x_forwarded_for() {
-    let config = ClientIpConfig::builder().trust_all_proxies().build().unwrap();
+fn trust_all_defaults_to_rightmost_x_forwarded_for() {
+    let config = ClientIpConfig::builder().trust_all_proxies().build();
+    let mut headers = HeaderMap::new();
+    // A client can write anything on the left, but the proxy appends the address it saw.
+    headers.insert("x-forwarded-for", HeaderValue::from_static("9.9.9.9, 203.0.113.10"));
+
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
+
+    assert_eq!(ip("203.0.113.10"), client_ip.ip());
+    assert_eq!(&chain_header_source("x-forwarded-for"), client_ip.source());
+}
+
+#[test]
+fn trust_all_can_select_the_leftmost_hop() {
+    let config = ClientIpConfig::builder()
+        .trust_all_proxies()
+        .chain_ip_selection(TrustAllChainIpSelection::Leftmost)
+        .build();
     let mut headers = HeaderMap::new();
     headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10, 198.51.100.7"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("203.0.113.10"), client_ip.ip());
-    assert_eq!(&ClientIpSource::XForwardedFor, client_ip.source());
+    assert_eq!(&chain_header_source("x-forwarded-for"), client_ip.source());
+}
+
+#[test]
+fn trust_all_can_skip_rightmost_hops() {
+    let config = ClientIpConfig::builder()
+        .trust_all_proxies()
+        .chain_ip_selection(TrustAllChainIpSelection::SkipRightmostHops(1))
+        .build();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-forwarded-for",
+        HeaderValue::from_static("203.0.113.10, 198.51.100.7, 10.0.0.2"),
+    );
+
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
+
+    assert_eq!(ip("198.51.100.7"), client_ip.ip());
+    assert_eq!(&chain_header_source("x-forwarded-for"), client_ip.source());
 }
 
 #[test]
 fn trust_all_skips_a_chain_header_with_an_opaque_selected_hop() {
-    let config = ClientIpConfig::builder().trust_all_proxies().build().unwrap();
+    let config = ClientIpConfig::builder().trust_all_proxies().build();
     let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", HeaderValue::from_static("unknown, 203.0.113.10"));
+    headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10, unknown"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("10.0.0.2"), client_ip.ip());
     assert_eq!(&ClientIpSource::Socket, client_ip.source());
@@ -152,52 +210,48 @@ fn trust_all_skips_a_chain_header_with_an_opaque_selected_hop() {
 #[test]
 fn trust_all_uses_custom_single_ip_header() {
     let header = HeaderName::from_static("x-client-ip");
-    let config = ClientIpConfig::builder()
-        .trust_all_proxies_with_client_ip_header(header.clone())
-        .build()
-        .unwrap();
+    let config =
+        ClientIpConfig::builder().trust_all_proxies().client_ip_header(header.clone()).build();
     let mut headers = HeaderMap::new();
     headers.insert(header.clone(), HeaderValue::from_static("203.0.113.10"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("203.0.113.10"), client_ip.ip());
     assert_eq!(&ClientIpSource::ConfiguredHeader(header), client_ip.source());
 }
 
 #[test]
-fn trust_all_can_use_custom_list_header_rightmost() {
+fn trust_all_can_use_custom_list_header() {
     let header = HeaderName::from_static("x-client-chain");
     let config = ClientIpConfig::builder()
         .trust_all_proxies()
-        .trust_all_chain_header_order([ChainHeader::new(header.clone())])
-        .trust_all_chain_ip_selection(TrustAllChainIpSelection::Rightmost)
-        .build()
-        .unwrap();
+        .chain_header_order([ChainHeader::new(header.clone())])
+        .build();
     let mut headers = HeaderMap::new();
     headers.insert(header.clone(), HeaderValue::from_static("203.0.113.10, 198.51.100.10"));
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("198.51.100.10"), client_ip.ip());
-    assert_eq!(&ClientIpSource::List(header), client_ip.source());
+    assert_eq!(&ClientIpSource::ChainHeader(header), client_ip.source());
 }
 
 #[test]
 fn chain_header_new_forwarded_uses_standard_parser() {
     let config = ClientIpConfig::builder()
         .trust_all_proxies()
-        .trust_all_chain_header_order([ChainHeader::new(HeaderName::from_static("forwarded"))])
-        .build()
-        .unwrap();
+        .chain_header_order([ChainHeader::new(HeaderName::from_static("forwarded"))])
+        .chain_ip_selection(TrustAllChainIpSelection::Leftmost)
+        .build();
     let mut headers = HeaderMap::new();
     headers.insert(
         "forwarded",
         HeaderValue::from_static(r#"for="[2001:db8::17]:4711";proto=https, for=198.51.100.10"#),
     );
 
-    let client_ip = resolve_client_ip(&headers, socket("10.0.0.2"), &config);
+    let client_ip = config.resolve_client_ip(&headers, ip("10.0.0.2"));
 
     assert_eq!(ip("2001:db8::17"), client_ip.ip());
-    assert_eq!(&ClientIpSource::Forwarded, client_ip.source());
+    assert_eq!(&chain_header_source("forwarded"), client_ip.source());
 }

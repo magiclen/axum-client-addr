@@ -8,7 +8,7 @@ async fn main() {
     // This is the safest and smallest setup.
     //
     // No proxy is trusted, so request headers like X-Real-IP and X-Forwarded-For are ignored. The result is always the socket peer IP that Axum gets from the TCP connection.
-    let config = ClientIpConfig::default();
+    let config = ClientIpConfig::builder().trust_no_proxy();
 
     // ClientIp needs ConnectInfo<SocketAddr>. The call to into_make_service_with_connect_info below is what makes Axum store that socket address in each request.
     let app = Router::new().route("/", get(handler)).with_state(config);

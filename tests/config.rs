@@ -1,6 +1,6 @@
-use axum::http::HeaderName;
 use axum_client_addr::{
-    ClientIpConfig, ClientIpConfigBuildError, IpCidr, TrustAllChainIpSelection,
+    ClientIpConfig, ClientIpConfigBuildError, HeaderName, IpCidr, TrustAllChainIpSelection,
+    TrustedProxyRule,
 };
 
 fn cidr(input: &str) -> IpCidr {
@@ -8,8 +8,18 @@ fn cidr(input: &str) -> IpCidr {
 }
 
 #[test]
-fn matching_metadata_cidrs_are_merged() {
+fn trust_no_proxy_is_the_default() {
+    let config = ClientIpConfig::default();
+
+    assert!(!config.trusts_all_proxies());
+    assert!(config.trusted_proxies().is_empty());
+    assert!(config.chain_header_order().is_empty());
+}
+
+#[test]
+fn cidrs_with_the_same_client_ip_header_are_merged() {
     let config = ClientIpConfig::builder()
+        .trusted_proxies()
         .proxy(cidr("10.0.0.0/25"))
         .proxy(cidr("10.0.0.128/25"))
         .build()
@@ -20,51 +30,51 @@ fn matching_metadata_cidrs_are_merged() {
 }
 
 #[test]
-fn overlapping_cidrs_with_different_metadata_are_rejected() {
+fn overlapping_cidrs_with_different_client_ip_headers_are_rejected() {
     let error = ClientIpConfig::builder()
+        .trusted_proxies()
         .proxy(cidr("10.0.0.0/24"))
         .proxy_with_x_real_ip(cidr("10.0.0.0/25"))
         .build()
         .unwrap_err();
 
-    assert!(matches!(error, ClientIpConfigBuildError::OverlappingTrustedProxyMetadata { .. }));
+    assert!(matches!(error, ClientIpConfigBuildError::OverlappingTrustedProxyRules { .. }));
 }
 
 #[test]
-fn trust_all_mode_cannot_be_combined_with_trusted_proxy_rules() {
-    let error = ClientIpConfig::builder()
-        .trust_all_proxies()
-        .proxy(cidr("10.0.0.0/24"))
-        .build()
-        .unwrap_err();
-
-    assert!(matches!(error, ClientIpConfigBuildError::TrustAllProxyModeWithTrustedProxyRules));
-}
-
-#[test]
-fn trust_all_settings_alone_do_not_enable_trust_all_mode() {
-    let error = ClientIpConfig::builder()
-        .trust_all_chain_ip_selection(TrustAllChainIpSelection::Rightmost)
-        .build()
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        ClientIpConfigBuildError::TrustAllProxySettingsWithoutTrustAllProxyMode
-    ));
-}
-
-#[test]
-fn trust_all_settings_apply_once_trust_all_mode_is_enabled() {
+fn proxy_rules_can_be_added_in_bulk() {
     let config = ClientIpConfig::builder()
-        .trust_all_chain_ip_selection(TrustAllChainIpSelection::Rightmost)
-        .trust_all_proxies_with_client_ip_header(HeaderName::from_static("x-client-ip"))
+        .trusted_proxies()
+        .proxies([
+            TrustedProxyRule::with_x_real_ip(cidr("10.0.0.0/24")),
+            TrustedProxyRule::new(cidr("198.51.100.0/24")),
+        ])
         .build()
         .unwrap();
 
+    assert_eq!(2, config.trusted_proxies().len());
+    assert!(config.is_trusted_proxy("10.0.0.2".parse().unwrap()));
+    assert!(config.is_trusted_proxy("198.51.100.7".parse().unwrap()));
+}
+
+#[test]
+fn trust_all_settings_are_kept_in_the_built_config() {
+    let config = ClientIpConfig::builder()
+        .trust_all_proxies()
+        .client_ip_header(HeaderName::from_static("x-client-ip"))
+        .chain_ip_selection(TrustAllChainIpSelection::Leftmost)
+        .build();
+
     let mode = config.trust_all_proxy_mode().unwrap();
 
-    assert!(config.trust_all_proxies());
-    assert_eq!(TrustAllChainIpSelection::Rightmost, mode.chain_ip_selection());
+    assert!(config.trusts_all_proxies());
+    assert_eq!(TrustAllChainIpSelection::Leftmost, mode.chain_ip_selection());
     assert_eq!(Some(&HeaderName::from_static("x-client-ip")), mode.client_ip_header());
+}
+
+#[test]
+fn trust_all_treats_every_ip_as_a_trusted_proxy() {
+    let config = ClientIpConfig::builder().trust_all_proxies().build();
+
+    assert!(config.is_trusted_proxy("203.0.113.10".parse().unwrap()));
 }

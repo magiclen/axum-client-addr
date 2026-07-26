@@ -3,22 +3,19 @@ use std::collections::HashMap;
 use cidr::IpCidr;
 use cidr_utils::combiner::{Ipv4CidrCombiner, Ipv6CidrCombiner};
 
-use crate::{ClientIpConfigBuildError, TrustedProxyMetadata, TrustedProxyRule};
+use crate::{ClientIpConfigBuildError, TrustedProxyRule, config::TrustedProxyMetadata};
 
 pub(crate) fn ensure_no_cross_metadata_overlap(
     rules: &[TrustedProxyRule],
 ) -> Result<(), ClientIpConfigBuildError> {
-    for i in 0..rules.len() {
-        for j in (i + 1)..rules.len() {
-            let left = &rules[i];
-            let right = &rules[j];
-
+    for (i, left) in rules.iter().enumerate() {
+        for right in &rules[i + 1..] {
             if left.metadata == right.metadata {
                 continue;
             }
 
             if cidrs_overlap(&left.cidr, &right.cidr) {
-                return Err(ClientIpConfigBuildError::OverlappingTrustedProxyMetadata {
+                return Err(ClientIpConfigBuildError::OverlappingTrustedProxyRules {
                     left:  Box::new(left.clone()),
                     right: Box::new(right.clone()),
                 });

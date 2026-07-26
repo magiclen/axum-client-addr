@@ -33,7 +33,11 @@ fn ip(input: &str) -> IpAddr {
 }
 
 fn trusted_config() -> ClientIpConfig {
-    ClientIpConfig::builder().proxy_with_x_real_ip(cidr("10.0.0.0/24")).build().unwrap()
+    ClientIpConfig::builder()
+        .trusted_proxies()
+        .proxy_with_x_real_ip(cidr("10.0.0.0/24"))
+        .build()
+        .unwrap()
 }
 
 fn request_parts() -> Parts {

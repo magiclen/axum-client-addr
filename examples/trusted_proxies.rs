@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
-use axum::{Router, http::HeaderName, routing::get};
-use axum_client_addr::{ChainHeader, ClientIp, ClientIpConfig, IpCidr};
+use axum::{Router, routing::get};
+use axum_client_addr::{ChainHeader, ClientIp, ClientIpConfig, HeaderName, IpCidr};
 
 #[tokio::main]
 async fn main() {
@@ -11,6 +11,7 @@ async fn main() {
     //
     // This example trusts loopback addresses so it works well for a local demo. In production, replace these CIDRs with the real Nginx private IP, subnet, or load-balancer subnet.
     let config = ClientIpConfig::builder()
+        .trusted_proxies()
         // A request from 127.0.0.1 is trusted and may use X-Real-IP.
         .proxy_with_client_ip_header("127.0.0.1/32".parse::<IpCidr>().unwrap(), x_real_ip.clone())
         // A request from ::1 is also trusted and may use X-Real-IP.

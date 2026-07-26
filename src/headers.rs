@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
 use axum::http::{HeaderMap, HeaderName};
@@ -16,6 +16,9 @@ pub(crate) enum ChainEntry {
     Opaque,
 }
 
+/// Read the single IP address of a configured client IP header.
+///
+/// The last usable value wins, because a proxy that appends instead of overwriting puts its own value after anything the client sent.
 pub(crate) fn configured_client_ip_header(
     headers: &HeaderMap,
     header: &HeaderName,
@@ -24,7 +27,8 @@ pub(crate) fn configured_client_ip_header(
         .get_all(header)
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .find_map(|raw| raw.trim().parse::<IpAddr>().ok())
+        .filter_map(|raw| raw.trim().parse::<IpAddr>().ok())
+        .next_back()
 }
 
 /// Collect the hops of an `X-Forwarded-For` style comma-separated header.
@@ -229,7 +233,7 @@ fn parse_ip_like(raw: &str) -> Option<IpAddr> {
 
     // IPv4 may use an obfuscated port in a Forwarded header.
     if let Some((host, port)) = raw.rsplit_once(':') {
-        if host.parse::<std::net::Ipv4Addr>().is_ok() && is_valid_node_port(port) {
+        if host.parse::<Ipv4Addr>().is_ok() && is_valid_node_port(port) {
             return host.parse::<IpAddr>().ok();
         }
     }

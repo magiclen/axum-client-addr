@@ -11,47 +11,40 @@ use crate::TrustedProxyRule;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ClientIpConfigBuildError {
-    /// CIDRs overlap but carry different metadata.
-    OverlappingTrustedProxyMetadata {
+    /// Trusted proxy CIDRs cover a common address but do not agree on the client IP header.
+    OverlappingTrustedProxyRules {
         /// The first overlapping trusted proxy rule.
         left: Box<TrustedProxyRule>,
 
         /// The second overlapping trusted proxy rule.
         right: Box<TrustedProxyRule>,
     },
-
-    /// Trust-all proxy mode cannot be combined with CIDR proxy rules.
-    TrustAllProxyModeWithTrustedProxyRules,
-
-    /// Trust-all proxy settings were configured, but trust-all proxy mode was never enabled.
-    TrustAllProxySettingsWithoutTrustAllProxyMode,
 }
 
 impl fmt::Display for ClientIpConfigBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientIpConfigBuildError::OverlappingTrustedProxyMetadata {
+            ClientIpConfigBuildError::OverlappingTrustedProxyRules {
                 left,
                 right,
             } => write!(
                 f,
-                "trusted proxy CIDRs overlap but have different metadata: {} {:?} overlaps {} {:?}",
+                "trusted proxy CIDRs overlap but use different client IP headers: {} ({}) \
+                 overlaps {} ({})",
                 left.cidr(),
-                left.metadata(),
+                describe_client_ip_header(left),
                 right.cidr(),
-                right.metadata(),
-            ),
-
-            ClientIpConfigBuildError::TrustAllProxyModeWithTrustedProxyRules => {
-                write!(f, "trust-all proxy mode cannot be combined with trusted proxy CIDR rules")
-            },
-
-            ClientIpConfigBuildError::TrustAllProxySettingsWithoutTrustAllProxyMode => write!(
-                f,
-                "trust-all proxy settings were configured without enabling trust-all proxy mode; \
-                 call trust_all_proxies or trust_all_proxies_with_client_ip_header"
+                describe_client_ip_header(right),
             ),
         }
+    }
+}
+
+/// Describe the client IP header of a rule for an error message.
+fn describe_client_ip_header(rule: &TrustedProxyRule) -> &str {
+    match rule.client_ip_header() {
+        Some(header) => header.as_str(),
+        None => "no client IP header",
     }
 }
 
