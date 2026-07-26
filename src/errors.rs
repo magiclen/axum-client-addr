@@ -7,16 +7,18 @@ use axum::{
 
 use crate::TrustedProxyRule;
 
-/// Error returned while building a [`crate::ClientIpConfig`].
-#[derive(Debug)]
+/// An error returned while building a [`crate::ClientIpConfig`].
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ClientIpConfigBuildError {
     /// Trusted proxy CIDRs cover a common address but do not agree on the client IP header.
+    ///
+    /// One socket peer IP has to mean one policy, so the config cannot be built until the CIDRs are changed to agree or to stop overlapping.
     OverlappingTrustedProxyRules {
-        /// The first overlapping trusted proxy rule.
+        /// The first of the two rules that overlap.
         left: Box<TrustedProxyRule>,
 
-        /// The second overlapping trusted proxy rule.
+        /// The second of the two rules that overlap.
         right: Box<TrustedProxyRule>,
     },
 }
@@ -24,7 +26,7 @@ pub enum ClientIpConfigBuildError {
 impl fmt::Display for ClientIpConfigBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientIpConfigBuildError::OverlappingTrustedProxyRules {
+            Self::OverlappingTrustedProxyRules {
                 left,
                 right,
             } => write!(
@@ -40,7 +42,7 @@ impl fmt::Display for ClientIpConfigBuildError {
     }
 }
 
-/// Describe the client IP header of a rule for an error message.
+/// Name the client IP header of a rule, for an error message.
 fn describe_client_ip_header(rule: &TrustedProxyRule) -> &str {
     match rule.client_ip_header() {
         Some(header) => header.as_str(),
@@ -50,18 +52,20 @@ fn describe_client_ip_header(rule: &TrustedProxyRule) -> &str {
 
 impl Error for ClientIpConfigBuildError {}
 
-/// Rejection returned by the [`crate::ClientIp`] extractor.
+/// The rejection returned by the [`crate::ClientIp`] extractor.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ClientIpRejection {
-    /// The request does not contain Axum connection information.
+    /// The request carries no `ConnectInfo<SocketAddr>`.
+    ///
+    /// Start the server with `into_make_service_with_connect_info::<SocketAddr>()` so that `axum` records the address every connection came from.
     MissingConnectInfo,
 }
 
 impl fmt::Display for ClientIpRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientIpRejection::MissingConnectInfo => write!(
+            Self::MissingConnectInfo => write!(
                 f,
                 "missing ConnectInfo<SocketAddr>; start axum with \
                  into_make_service_with_connect_info::<SocketAddr>()"
@@ -74,9 +78,9 @@ impl Error for ClientIpRejection {}
 
 impl IntoResponse for ClientIpRejection {
     fn into_response(self) -> Response {
-        // The Display message names internal setup details, so it is kept out of the response body.
+        // This is a server setup mistake, not a bad request, and the Display message names internal details, so the response body says nothing about it.
         match self {
-            ClientIpRejection::MissingConnectInfo => {
+            Self::MissingConnectInfo => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
             },
         }

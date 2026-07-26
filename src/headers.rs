@@ -3,23 +3,25 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use axum::http::{HeaderMap, HeaderName};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, header::GetAll};
+
+use crate::canonical::canonical_ip;
 
 /// One hop found in a chain header.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ChainEntry {
     /// A hop with a usable IP address.
     Ip(IpAddr),
 
     /// A hop that exists but carries no usable IP address.
     ///
-    /// This covers `unknown`, RFC 7239 obfuscated identifiers, unparsable text, and `Forwarded` elements without a `for` parameter. Such a hop cannot be checked against the trusted proxy rules.
+    /// This covers `unknown`, RFC 7239 obfuscated identifiers, unreadable text, and `Forwarded` elements without a `for` parameter. Such a hop cannot be checked against the trusted proxy rules, but it still takes one place in the chain.
     Opaque,
 }
 
 /// Read the single IP address of a configured client IP header.
 ///
-/// Only the last value is read, because a proxy that appends instead of overwriting puts its own value after anything the client sent. A last value that is not a plain IP address makes the whole header unusable, so an earlier client-written value can never win.
+/// Only the last value is read, because a proxy that appends instead of overwriting puts its own value after anything the client sent. A last value that is not a plain IP address makes the whole header unusable, so a value the client wrote earlier can never win.
 pub(crate) fn configured_client_ip_header(
     headers: &HeaderMap,
     header: &HeaderName,
@@ -31,13 +33,13 @@ pub(crate) fn configured_client_ip_header(
 
 /// Iterate the hops of an `X-Forwarded-For` style comma-separated header, from left to right.
 ///
-/// Returns [`None`] when a value is not UTF-8, because such a value hides an unknown number of hops and would shift every position in the chain.
+/// Several lines of one header name are one list, joined in the order they arrived.
+///
+/// Returns [`None`] when a value is not readable as visible ASCII, because such a value hides an unknown number of hops and would shift the position of every hop next to it.
 pub(crate) fn list_header_entries<'a>(
-    headers: &'a HeaderMap,
-    header: &'a HeaderName,
+    values: GetAll<'a, HeaderValue>,
 ) -> Option<impl DoubleEndedIterator<Item = ChainEntry> + 'a> {
-    let values = headers.get_all(header);
-
+    // The whole header has to be judged before any hop is produced, so this check cannot be folded into the iterator below.
     if values.iter().any(|value| value.to_str().is_err()) {
         return None;
     }
@@ -54,22 +56,16 @@ pub(crate) fn list_header_entries<'a>(
     )
 }
 
-/// Collect the hops of a standard `Forwarded` header into `entries`, from left to right.
+/// Collect the hops of a standard `Forwarded` header, from left to right.
 ///
-/// The `Forwarded` syntax cannot be scanned backwards, so its hops are buffered instead of iterated lazily.
+/// The `Forwarded` syntax cannot be scanned backwards, because a quote mark only tells you whether it opens or closes a string once you know what came before it. The hops are therefore collected instead of iterated lazily.
 ///
-/// Returns `false` when a value is not UTF-8, for the same reason as [`list_header_entries`].
-pub(crate) fn forwarded_entries(
-    headers: &HeaderMap,
-    header: &HeaderName,
-    entries: &mut Vec<ChainEntry>,
-) -> bool {
-    entries.clear();
+/// Returns [`None`] when a value is not readable as visible ASCII, for the same reason as [`list_header_entries`].
+pub(crate) fn forwarded_entries(values: GetAll<'_, HeaderValue>) -> Option<Vec<ChainEntry>> {
+    let mut entries = Vec::new();
 
-    for value in headers.get_all(header).iter() {
-        let Ok(raw) = value.to_str() else {
-            return false;
-        };
+    for value in &values {
+        let raw = value.to_str().ok()?;
 
         for element in SplitQuoted::new(raw, ',') {
             if element.is_empty() {
@@ -80,15 +76,19 @@ pub(crate) fn forwarded_entries(
         }
     }
 
-    true
+    Some(entries)
 }
 
+/// Read the `for` parameter of one `Forwarded` element.
+///
+/// An element may also carry `by`, `host`, and `proto`, which say nothing about the client address and are skipped.
 fn forwarded_element_entry(element: &str) -> ChainEntry {
     for pair in SplitQuoted::new(element, ';') {
         let Some((name, value)) = pair.split_once('=') else {
             continue;
         };
 
+        // RFC 7239 parameter names are case-insensitive, so `For=` is the same as `for=`.
         if !name.trim().eq_ignore_ascii_case("for") {
             continue;
         }
@@ -105,14 +105,6 @@ fn chain_entry(raw: &str) -> ChainEntry {
         Some(ip) => ChainEntry::Ip(canonical_ip(ip)),
         None => ChainEntry::Opaque,
     }
-}
-
-/// Rewrite an IPv4-mapped IPv6 address into its IPv4 form.
-///
-/// A dual-stack listener reports IPv4 peers as `::ffff:a.b.c.d`, and some proxies write that form into their headers. Without this, an IPv4 CIDR would never match such an address.
-#[inline]
-pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
-    ip.to_canonical()
 }
 
 /// Split by a delimiter, but ignore delimiters inside HTTP quoted strings.
@@ -144,11 +136,13 @@ impl<'a> Iterator for SplitQuoted<'a> {
         let mut escaped = false;
 
         for (offset, ch) in self.input[start..].char_indices() {
+            // A backslash hides whatever follows it, even another backslash or a quote mark.
             if escaped {
                 escaped = false;
                 continue;
             }
 
+            // Outside a quoted string a backslash is an ordinary character, so only quoted text starts an escape.
             if in_quotes && ch == '\\' {
                 escaped = true;
                 continue;
@@ -159,6 +153,7 @@ impl<'a> Iterator for SplitQuoted<'a> {
                 continue;
             }
 
+            // A delimiter inside a quoted string belongs to the value, not to the list.
             if ch == self.delimiter && !in_quotes {
                 let end = start + offset;
 
@@ -174,6 +169,9 @@ impl<'a> Iterator for SplitQuoted<'a> {
     }
 }
 
+/// Remove the quotes of an HTTP quoted string and undo its escapes.
+///
+/// Input that is not quoted is returned as it is.
 #[inline]
 fn unquote_http_quoted_string(input: &str) -> Cow<'_, str> {
     let input = input.trim();
@@ -184,6 +182,7 @@ fn unquote_http_quoted_string(input: &str) -> Cow<'_, str> {
 
     let inner = &input[1..input.len() - 1];
 
+    // Without a backslash the text between the quotes is already the value, so nothing has to be built.
     if !inner.contains('\\') {
         return Cow::Borrowed(inner);
     }
@@ -209,18 +208,22 @@ fn unquote_http_quoted_string(input: &str) -> Cow<'_, str> {
     Cow::Owned(output)
 }
 
+/// Read the IP address of one hop, in any of the forms a proxy may write.
 #[inline]
 fn parse_ip_like(raw: &str) -> Option<IpAddr> {
     let raw = raw.trim();
 
+    // `unknown` and identifiers that start with `_` are the RFC 7239 ways of naming a hop without revealing its address.
     if raw.is_empty() || raw.eq_ignore_ascii_case("unknown") || raw.starts_with('_') {
         return None;
     }
 
+    // A plain address, such as `203.0.113.10` or `2001:db8::17`.
     if let Ok(ip) = raw.parse::<IpAddr>() {
         return Some(ip);
     }
 
+    // A bracketed IPv6 address, such as `[2001:db8::17]` or `[2001:db8::17]:4711`.
     if let Some(rest) = raw.strip_prefix('[') {
         let close_bracket = rest.find(']')?;
         let ip_part = &rest[..close_bracket];
@@ -236,14 +239,16 @@ fn parse_ip_like(raw: &str) -> Option<IpAddr> {
             }
         }
 
+        // Anything else after the bracket is not a hop this crate understands.
         return None;
     }
 
+    // An IPv4 address with a normal port, such as `192.0.2.43:47011`.
     if let Ok(socket_addr) = raw.parse::<SocketAddr>() {
         return Some(socket_addr.ip());
     }
 
-    // IPv4 may use an obfuscated port in a Forwarded header.
+    // An IPv4 address whose port is hidden, such as `192.0.2.43:_secret`.
     if let Some((host, port)) = raw.rsplit_once(':') {
         if host.parse::<Ipv4Addr>().is_ok() && is_valid_node_port(port) {
             return host.parse::<IpAddr>().ok();
@@ -253,6 +258,9 @@ fn parse_ip_like(raw: &str) -> Option<IpAddr> {
     None
 }
 
+/// Check the port part of an RFC 7239 node identifier.
+///
+/// A port is either a number or an obfuscated name that starts with `_`.
 #[inline]
 fn is_valid_node_port(port: &str) -> bool {
     if port.is_empty() {

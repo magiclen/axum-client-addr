@@ -1,39 +1,45 @@
-use std::collections::HashMap;
+use std::{cmp::Reverse, collections::HashMap};
 
 use cidr::IpCidr;
 use cidr_utils::combiner::{Ipv4CidrCombiner, Ipv6CidrCombiner};
 
 use crate::{ClientIpConfigBuildError, TrustedProxyRule, config::TrustedProxyMetadata};
 
+/// Reject rules that share an address but do not agree on what that address means.
+///
+/// One socket peer must lead to one policy. Two rules that cover a common address but name different client IP headers would give that address two policies, so the config is rejected instead of picking one.
 pub(crate) fn ensure_no_cross_metadata_overlap(
     rules: &[TrustedProxyRule],
 ) -> Result<(), ClientIpConfigBuildError> {
-    for (i, left) in rules.iter().enumerate() {
-        for right in &rules[i + 1..] {
-            if left.metadata == right.metadata {
-                continue;
-            }
+    let mut order: Vec<&TrustedProxyRule> = rules.iter().collect();
 
-            if cidrs_overlap(&left.cidr, &right.cidr) {
-                return Err(ClientIpConfigBuildError::OverlappingTrustedProxyRules {
-                    left:  Box::new(left.clone()),
-                    right: Box::new(right.clone()),
-                });
-            }
+    // A network must be visited before the ones it contains, so a tie on the first address puts the wider network first.
+    order.sort_by_key(|rule| (rule.cidr.first_address(), Reverse(rule.cidr.last_address())));
+
+    // This holds the widest network that is still open, and it is the only one a later rule can reach into. Two networks of one address family are either nested or disjoint, so a rule that reaches into it is nested inside it and ends no later than it does. An address family change ends it too, because every IPv4 address sorts before every IPv6 address.
+    let mut open: Option<&TrustedProxyRule> = None;
+
+    for rule in order {
+        match open {
+            Some(outer) if rule.cidr.first_address() <= outer.cidr.last_address() => {
+                // Every rule already nested inside this one had to agree with it to get here, so agreeing with the widest is agreeing with them all.
+                if outer.metadata != rule.metadata {
+                    return Err(ClientIpConfigBuildError::OverlappingTrustedProxyRules {
+                        left:  Box::new(outer.clone()),
+                        right: Box::new(rule.clone()),
+                    });
+                }
+            },
+            _ => open = Some(rule),
         }
     }
 
     Ok(())
 }
 
-#[inline]
-fn cidrs_overlap(left: &IpCidr, right: &IpCidr) -> bool {
-    match (left, right) {
-        (IpCidr::V4(_), IpCidr::V6(_)) | (IpCidr::V6(_), IpCidr::V4(_)) => false,
-        _ => left.contains(&right.first_address()) || right.contains(&left.first_address()),
-    }
-}
-
+/// Join rules that agree on their metadata into as few rules as possible.
+///
+/// Rules are grouped by metadata first, because only rules with the same metadata may be replaced by one wider rule. Rules of different groups are left alone, and [`ensure_no_cross_metadata_overlap`] has already proven that they do not overlap.
 pub(crate) fn merge_rules_by_metadata(rules: Vec<TrustedProxyRule>) -> Vec<TrustedProxyRule> {
     let mut groups: HashMap<TrustedProxyMetadata, Vec<IpCidr>> = HashMap::new();
 
@@ -44,18 +50,18 @@ pub(crate) fn merge_rules_by_metadata(rules: Vec<TrustedProxyRule>) -> Vec<Trust
     let mut merged = Vec::new();
 
     for (metadata, cidrs) in groups {
-        for cidr in merge_cidrs(cidrs) {
-            merged.push(TrustedProxyRule {
-                cidr,
-                metadata: metadata.clone(),
-            });
-        }
+        merged.extend(merge_cidrs(cidrs).into_iter().map(|cidr| TrustedProxyRule {
+            cidr,
+            metadata: metadata.clone(),
+        }));
     }
 
     merged
 }
 
+/// Turn a list of networks into the shortest list of networks that covers the same addresses.
 fn merge_cidrs(cidrs: Vec<IpCidr>) -> Vec<IpCidr> {
+    // The two address families never merge into each other, so each one gets its own combiner.
     let mut ipv4 = Ipv4CidrCombiner::new();
     let mut ipv6 = Ipv6CidrCombiner::new();
 

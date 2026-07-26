@@ -6,11 +6,12 @@ use axum_client_addr::{ClientIp, ClientIpConfig};
 #[tokio::main]
 async fn main() {
     // This is the safest and smallest setup.
-    //
-    // No proxy is trusted, so request headers like X-Real-IP and X-Forwarded-For are ignored. The result is always the socket peer IP that Axum gets from the TCP connection.
+    // No proxy is trusted, so headers such as X-Real-IP and X-Forwarded-For are ignored.
+    // The answer is always the address the TCP connection came from.
     let config = ClientIpConfig::builder().trust_no_proxy();
 
-    // ClientIp needs ConnectInfo<SocketAddr>. The call to into_make_service_with_connect_info below is what makes Axum store that socket address in each request.
+    // ClientIp needs ConnectInfo<SocketAddr>.
+    // The into_make_service_with_connect_info call below is what puts that address into each request.
     let app = Router::new().route("/", get(handler)).with_state(config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
 
@@ -20,6 +21,6 @@ async fn main() {
 }
 
 async fn handler(client_ip: ClientIp) -> String {
-    // In this example the source should be ClientIpSource::Socket, because no proxy headers are trusted.
-    format!("client_ip={} source={:?}\n", client_ip.ip(), client_ip.source(),)
+    // The source is always ClientIpSource::Socket here, because no header is trusted.
+    format!("client_ip={} source={:?}\n", client_ip.ip(), client_ip.source())
 }
