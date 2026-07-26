@@ -7,6 +7,36 @@ Resolve client IP addresses in `axum` from trusted proxy headers with safe socke
 
 The `ClientIp` extractor reads a `ClientIpConfig` from the application state. The config decides how much of a request is allowed to influence the answer, and it always falls back to the socket peer IP that `axum` stores in `ConnectInfo`.
 
+## The forwarding chain
+
+`X-Forwarded-For` is a comma-separated list, and each proxy along the path appends the address it received the request from. Take a client at `203.0.113.10` that reaches the service through two proxies.
+
+```text
+203.0.113.10  ->  198.51.100.7  ->  10.0.0.2  ->  service
+   client            proxy 1         proxy 2
+```
+
+The service then sees this request.
+
+```text
+X-Forwarded-For: 203.0.113.10, 198.51.100.7
+socket peer: 10.0.0.2
+```
+
+* The **leftmost** value is the oldest hop. It is the original client if every proxy on the path appended honestly, but it is also the part a client can write freely, because the first proxy appends to whatever the client sent instead of replacing it.
+* The **rightmost** value is the newest hop, written by the proxy closest to the service. It is the address that proxy received the request from.
+* The **socket peer IP is not in the header**. It belongs to the proxy that opened the connection, so the full path is the header values followed by the socket peer.
+
+Every hop is only as trustworthy as the proxy that wrote it. The rightmost value came from the proxy in front of the service, so it is the one entry in the list that no client can choose. Everything further left was copied from what an earlier hop claimed.
+
+`Forwarded` (RFC 7239) carries the same chain in a different syntax, with the same left-to-right meaning.
+
+```text
+Forwarded: for=203.0.113.10, for=198.51.100.7
+```
+
+`X-Forwarded-For` is read as a comma-separated IP list, `Forwarded` is read with the standard RFC 7239 syntax, and any other header name added through `ChainHeader::new` is read as a comma-separated IP list. A hop may carry a port, and an IPv6 hop may be bracketed, so `192.0.2.43:47011` and `[2001:db8::17]:4711` both work.
+
 ## Trust models
 
 A config uses exactly one trust model, chosen as the first step of `ClientIpConfig::builder`.
@@ -59,9 +89,9 @@ Resolution runs in this order.
 
 There is no CIDR check here, so the chain is not scanned. If the picked hop carries no usable IP address, or the chain is shorter than the selection needs, the next chain header is tried.
 
-## How a chain header is read
+## A worked example
 
-Both trust models share the same parsing. The example below resolves a request without running a server.
+The example below resolves the request from the diagram above without running a server.
 
 ```rust
 let config = ClientIpConfig::builder()
@@ -72,17 +102,15 @@ let config = ClientIpConfig::builder()
     .unwrap();
 
 let mut headers = HeaderMap::new();
-headers.insert("x-forwarded-for", "203.0.113.10, 198.51.100.7, 10.0.0.2".parse().unwrap());
+headers.insert("x-forwarded-for", "203.0.113.10, 198.51.100.7".parse().unwrap());
 
-// The peer 10.0.0.2 is trusted, so the chain is scanned from the right.
-// 10.0.0.2 and 198.51.100.7 are trusted proxies, so the scan walks past them.
+// The socket peer 10.0.0.2 is trusted, so the chain is scanned from the right.
+// 198.51.100.7 is a trusted proxy too, so the scan walks past it.
 let client_ip = config.resolve_client_ip(&headers, "10.0.0.2".parse::<IpAddr>().unwrap());
 
 assert_eq!("203.0.113.10".parse::<IpAddr>().unwrap(), client_ip.ip());
 assert_eq!(&ClientIpSource::ChainHeader(HeaderName::from_static("x-forwarded-for")), client_ip.source());
 ```
-
-`X-Forwarded-For` is read as a comma-separated IP list, `Forwarded` is read with the standard RFC 7239 syntax, and any other header name added through `ChainHeader::new` is read as a comma-separated IP list. A hop may carry a port, and an IPv6 hop may be bracketed, so `192.0.2.43:47011` and `[2001:db8::17]:4711` both work.
 
 ## Using the extractor
 
