@@ -145,8 +145,6 @@ async fn handler(client_ip: ClientIp) -> String {
 
 Any state that implements `ClientIpConfigSource` works, so the config can live next to the rest of your application state. `Arc<T>` forwards to the inner state, and `ClientIpConfig` itself is a valid state.
 
-See the [`examples`](examples) directory for a runnable server per trust model, plus a rate-limiting example that keys a throttle on the resolved client IP.
-
 ## Security notes
 
 * A client IP header only means something if the proxy always overwrites it. If the proxy appends instead, the last value wins, because that is the one the client could not write.
